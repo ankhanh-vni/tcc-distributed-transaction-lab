@@ -12,3 +12,4 @@ HELP.md
 .flattened-pom.xml
 build/
 .claude/
+.omx/
