@@ -11,3 +11,4 @@ HELP.md
 .mvn/wrapper/maven-wrapper.jar
 .flattened-pom.xml
 build/
+.claude/
