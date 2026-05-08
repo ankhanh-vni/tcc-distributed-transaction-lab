@@ -1,0 +1,39 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: coordinator-service
+  datasource:
+    url: ${COORDINATOR_DB_URL:jdbc:postgresql://localhost:5432/coordinator_db}
+    username: ${COORDINATOR_DB_USER:coordinator}
+    password: ${COORDINATOR_DB_PASS:coordinator}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+tcc:
+  participants:
+    inventory:
+      base-url: ${INVENTORY_BASE_URL:http://localhost:8081}
+      resource-path: /tcc/inventory/reservations
+    payment:
+      base-url: ${PAYMENT_BASE_URL:http://localhost:8082}
+      resource-path: /tcc/payment/authorizations
+    order:
+      base-url: ${ORDER_BASE_URL:http://localhost:8083}
+      resource-path: /tcc/orders
+  client:
+    connect-timeout-ms: 1000
+    read-timeout-ms: 2000
+  recovery:
+    enabled: true
+    fixed-delay-ms: 5000
+    stuck-after-ms: 8000
+
+logging:
+  level:
+    com.tcc: DEBUG

@@ -1,0 +1,87 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  inventory-service:
+    image: eclipse-temurin:21-jre-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./inventory-service/target:/app
+    command: ["sh", "-c", "java -jar inventory-service-0.1.0-SNAPSHOT.jar"]
+    environment:
+      INVENTORY_DB_URL: jdbc:postgresql://postgres:5432/inventory_db
+      INVENTORY_DB_USER: inventory
+      INVENTORY_DB_PASS: inventory
+    ports:
+      - "8081:8081"
+
+  payment-service:
+    image: eclipse-temurin:21-jre-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./payment-service/target:/app
+    command: ["sh", "-c", "java -jar payment-service-0.1.0-SNAPSHOT.jar"]
+    environment:
+      PAYMENT_DB_URL: jdbc:postgresql://postgres:5432/payment_db
+      PAYMENT_DB_USER: payment
+      PAYMENT_DB_PASS: payment
+    ports:
+      - "8082:8082"
+
+  order-service:
+    image: eclipse-temurin:21-jre-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./order-service/target:/app
+    command: ["sh", "-c", "java -jar order-service-0.1.0-SNAPSHOT.jar"]
+    environment:
+      ORDER_DB_URL: jdbc:postgresql://postgres:5432/order_db
+      ORDER_DB_USER: orders
+      ORDER_DB_PASS: orders
+    ports:
+      - "8083:8083"
+
+  coordinator-service:
+    image: eclipse-temurin:21-jre-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inventory-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+    working_dir: /app
+    volumes:
+      - ./coordinator-service/target:/app
+    command: ["sh", "-c", "java -jar coordinator-service-0.1.0-SNAPSHOT.jar"]
+    environment:
+      COORDINATOR_DB_URL: jdbc:postgresql://postgres:5432/coordinator_db
+      COORDINATOR_DB_USER: coordinator
+      COORDINATOR_DB_PASS: coordinator
+      INVENTORY_BASE_URL: http://inventory-service:8081
+      PAYMENT_BASE_URL: http://payment-service:8082
+      ORDER_BASE_URL: http://order-service:8083
+    ports:
+      - "8080:8080"
