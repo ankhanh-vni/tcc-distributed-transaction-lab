@@ -29,3 +29,25 @@ jobs:
         with:
           name: test-reports
           path: '**/target/surefire-reports/*'
+
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Package sandbox services
+        run: mvn -B -DskipTests package
+      - name: Stress isolated sandbox
+        run: python3 scripts/stress-test.py --source . --label baseline
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-results
+          path: stress-results/
