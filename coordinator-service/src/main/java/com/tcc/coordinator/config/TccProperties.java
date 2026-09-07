@@ -39,6 +39,12 @@ public class TccProperties {
     }
 
     public static class Recovery {
+        private long leaseMs = 30000;
+        private int batchSize = 100;
+        public long getLeaseMs() { return leaseMs; }
+        public void setLeaseMs(long v) { if (v < 1 || v > 3_600_000) throw new IllegalArgumentException("lease-ms must be 1..3600000"); leaseMs = v; }
+        public int getBatchSize() { return batchSize; }
+        public void setBatchSize(int v) { if (v < 1 || v > 10000) throw new IllegalArgumentException("batch-size must be 1..10000"); batchSize = v; }
         private boolean enabled = true;
         private long fixedDelayMs = 5000;
         private long stuckAfterMs = 8000;

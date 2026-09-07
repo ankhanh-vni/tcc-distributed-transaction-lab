@@ -71,6 +71,13 @@ class RecoveryServiceTest {
     @Autowired TransactionParticipantRepository participants;
     @MockBean ParticipantClient participantClient;
 
+    @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
+
+    @org.junit.jupiter.api.BeforeEach
+    void resetDatabase() {
+        jdbc.execute("TRUNCATE transaction_participant, global_transaction CASCADE");
+    }
+
     @Test
     void recovers_stuckTryingTransaction_toCancelled_whenInventoryIsTried() {
         // Simulate: coordinator started a tx, inventory Try succeeded, then coordinator crashed
@@ -119,13 +126,13 @@ class RecoveryServiceTest {
                 ParticipantTxState.TRIED, "{}"));
         backdate(g);
 
-        doNothing().when(participantClient).callConfirm(any());
+        doNothing().when(participantClient).callConfirm(any(), any());
 
         int driven = recovery.recoverOnce();
 
         assertThat(driven).isEqualTo(1);
         assertThat(globals.findById(txId).orElseThrow().getState()).isEqualTo(GlobalTxState.CONFIRMED);
-        verify(participantClient, org.mockito.Mockito.times(2)).callConfirm(any());
+        verify(participantClient, org.mockito.Mockito.times(2)).callConfirm(any(), any());
     }
 
     @Test
@@ -135,28 +142,13 @@ class RecoveryServiceTest {
         globals.saveAndFlush(g);
         participants.saveAndFlush(new TransactionParticipant(txId, "inventory", "http://x", "/tcc/inventory/reservations",
                 ParticipantTxState.TRIED, "{}"));
-        // updated_at is "now" (set by @PrePersist) — recovery threshold is stuck-after-ms,
-        // configured to 1ms in the test, but the find query compares strictly less-than.
-        // We need to ensure 1ms passes; sleep briefly.
-        try { Thread.sleep(5); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-
-        doNothing().when(participantClient).callConfirm(any());
-        int driven = recovery.recoverOnce();
-
-        // Even after sleeping, this scenario shows recovery picks it up because stuck-after-ms=1.
-        // We assert only that the recovery process itself does not error.
-        assertThat(driven).isGreaterThanOrEqualTo(0);
+        jdbc.update("update global_transaction set updated_at=clock_timestamp() + interval '1 hour' where tx_id=?", txId);
+        assertThat(recovery.recoverOnce()).isZero();
+        org.mockito.Mockito.verifyNoInteractions(participantClient);
     }
 
     /** Push the global tx's updated_at into the past so the recovery threshold matches it. */
     private void backdate(GlobalTransaction g) {
-        // Spring/JPA does not let us set updated_at directly via the entity (it's set by @PreUpdate).
-        // For this test, the threshold is 1ms — we just need to wait briefly so the row's
-        // updated_at < now() - 1ms. A short sleep suffices.
-        try {
-            Thread.sleep(5);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        jdbc.update("update global_transaction set updated_at=clock_timestamp() - interval '1 hour' where tx_id=?", g.getTxId());
     }
 }

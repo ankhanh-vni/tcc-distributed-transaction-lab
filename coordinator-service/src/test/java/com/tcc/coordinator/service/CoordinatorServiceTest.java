@@ -81,10 +81,17 @@ class CoordinatorServiceTest {
     }
 
     /** Scenario 1: all participants succeed → CONFIRMED. */
+    @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
+
+    @org.junit.jupiter.api.BeforeEach
+    void resetDatabase() {
+        jdbc.execute("TRUNCATE transaction_participant, global_transaction CASCADE");
+    }
+
     @Test
     void allParticipantsSucceed_terminatesAsConfirmed() {
         doNothing().when(participantClient).callTry(any(), any());
-        doNothing().when(participantClient).callConfirm(any());
+        doNothing().when(participantClient).callConfirm(any(), any());
 
         UUID txId = coordinator.placeOrder(sampleOrder(), null);
 
@@ -94,7 +101,7 @@ class CoordinatorServiceTest {
         assertThat(ps).hasSize(3);
         assertThat(ps).allMatch(p -> p.getState() == ParticipantTxState.CONFIRMED);
         verify(participantClient, times(3)).callTry(any(), any());
-        verify(participantClient, times(3)).callConfirm(any());
+        verify(participantClient, times(3)).callConfirm(any(), any());
     }
 
     /** Scenario 2: payment Try fails → CANCELLED, Confirm never called. */
@@ -113,16 +120,16 @@ class CoordinatorServiceTest {
         assertThat(ps).extracting(TransactionParticipant::getState)
                 .containsExactlyInAnyOrder(ParticipantTxState.CANCELLED, ParticipantTxState.CANCELLED, ParticipantTxState.CANCELLED);
         verify(participantClient, atLeastOnce()).callCancel(any(), any());
-        verify(participantClient, times(0)).callConfirm(any());
+        verify(participantClient, times(0)).callConfirm(any(), any());
     }
 
     /** Scenario 5/6: participant returns 409 during Confirm → HEURISTIC. */
     @Test
     void confirmReturns409_isHeuristic() {
         doNothing().when(participantClient).callTry(any(), any());
-        doNothing().when(participantClient).callConfirm(any());
+        doNothing().when(participantClient).callConfirm(any(), any());
         doThrow(new ParticipantCallException("payment", "CONFIRM", 409, "Confirm after Cancel", new RuntimeException()))
-                .when(participantClient).callConfirm(argParticipantNamed("payment"));
+                .when(participantClient).callConfirm(argParticipantNamed("payment"), any());
 
         UUID txId = coordinator.placeOrder(sampleOrder(), null);
 
@@ -156,10 +163,10 @@ class CoordinatorServiceTest {
         // First Confirm to "order" fails as a transport error; second attempt succeeds.
         doThrow(new ParticipantCallException("order", "CONFIRM", -1, "timeout", new RuntimeException("timeout")))
                 .doNothing()
-                .when(participantClient).callConfirm(argParticipantNamed("order"));
+                .when(participantClient).callConfirm(argParticipantNamed("order"), any());
         // The other two participants succeed normally.
-        doNothing().when(participantClient).callConfirm(argParticipantNamed("inventory"));
-        doNothing().when(participantClient).callConfirm(argParticipantNamed("payment"));
+        doNothing().when(participantClient).callConfirm(argParticipantNamed("inventory"), any());
+        doNothing().when(participantClient).callConfirm(argParticipantNamed("payment"), any());
 
         UUID txId = coordinator.placeOrder(sampleOrder(), null);
 
@@ -180,7 +187,7 @@ class CoordinatorServiceTest {
     @Test
     void redrivingTerminalTransaction_isNoOp() {
         doNothing().when(participantClient).callTry(any(), any());
-        doNothing().when(participantClient).callConfirm(any());
+        doNothing().when(participantClient).callConfirm(any(), any());
         UUID txId = coordinator.placeOrder(sampleOrder(), null);
 
         // Drive a few more times; should remain CONFIRMED, no extra RPCs.
@@ -190,7 +197,119 @@ class CoordinatorServiceTest {
         var g = globals.findById(txId).orElseThrow();
         assertThat(g.getState()).isEqualTo(GlobalTxState.CONFIRMED);
         verify(participantClient, times(3)).callTry(any(), any());
-        verify(participantClient, times(3)).callConfirm(any());
+        verify(participantClient, times(3)).callConfirm(any(), any());
+    }
+
+    @Autowired CoordinatorTxOps txOps;
+
+    private UUID seed(GlobalTxState state) {
+        UUID id = UUID.randomUUID();
+        txOps.seedTransaction(id, sampleOrder(), (tx, name) -> "{}");
+        jdbc.update("update global_transaction set state=? where tx_id=?", state.name(), id);
+        return id;
+    }
+
+    @Test
+    void failedTryCrashSnapshot_cancelsWithoutAnyFurtherTryOrConfirm() {
+        UUID id = seed(GlobalTxState.TRYING);
+        jdbc.update("update transaction_participant set state='FAILED' where tx_id=? and participant='payment'", id);
+        assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.CANCELLED);
+        verify(participantClient, times(0)).callTry(any(), any());
+        verify(participantClient, times(0)).callConfirm(any(), any());
+        verify(participantClient, times(3)).callCancel(any(), any());
+    }
+
+    @Test
+    void conflictCrashSnapshot_becomesHeuristicWithoutRpc() {
+        UUID id = seed(GlobalTxState.CONFIRMING);
+        jdbc.update("update transaction_participant set state='TRIED' where tx_id=?", id);
+        jdbc.update("update transaction_participant set state='FAILED' where tx_id=? and participant='payment'", id);
+        assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.HEURISTIC);
+        org.mockito.Mockito.verifyNoInteractions(participantClient);
+    }
+
+    @Test
+    void emptyParticipantLog_neverReportsSuccess() {
+        UUID id = seed(GlobalTxState.TRYING);
+        jdbc.update("delete from transaction_participant where tx_id=?", id);
+        assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.HEURISTIC);
+        org.mockito.Mockito.verifyNoInteractions(participantClient);
+    }
+
+    @Test
+    void phaseDecisionsCannotReverse() {
+        UUID id = seed(GlobalTxState.CONFIRMING);
+        UUID owner = UUID.randomUUID();
+        assertThat(txOps.acquire(id, owner)).isTrue();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                txOps.transitionGlobal(id, owner, GlobalTxState.CANCELLING, "stale failure"))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(globals.findById(id).orElseThrow().getState()).isEqualTo(GlobalTxState.CONFIRMING);
+    }
+
+    @Test
+    void activeOwnerExcludesAnotherDrive_andExpiredOwnerCannotWriteOrReleaseNewLease() {
+        UUID id = seed(GlobalTxState.TRYING);
+        UUID old = UUID.randomUUID();
+        assertThat(txOps.acquire(id, old)).isTrue();
+        assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.TRYING);
+        org.mockito.Mockito.verifyNoInteractions(participantClient);
+        jdbc.update("update global_transaction set lease_until=clock_timestamp() - interval '1 second' where tx_id=?", id);
+        UUID replacement = UUID.randomUUID();
+        assertThat(txOps.acquire(id, replacement)).isTrue();
+        Long row = participants.findByTxIdOrderByIdAsc(id).getFirst().getId();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> txOps.failParticipant(
+                id, old, row, GlobalTxState.TRYING, "late failure")).isInstanceOf(StaleDriverException.class);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> txOps.markParticipant(
+                id, old, row, GlobalTxState.TRYING, ParticipantTxState.TRIED, null)).isInstanceOf(StaleDriverException.class);
+        txOps.release(id, old);
+        assertThat(globals.findById(id).orElseThrow().getDriverToken()).isEqualTo(replacement);
+        assertThat(participants.findById(row).orElseThrow().getState()).isEqualTo(ParticipantTxState.PENDING);
+        txOps.release(id, replacement);
+    }
+
+    @Test
+    void failedTryAndCancellationDecisionAreCommittedTogether() {
+        UUID id = seed(GlobalTxState.TRYING);
+        UUID owner = UUID.randomUUID();
+        txOps.acquire(id, owner);
+        Long row = participants.findByTxIdOrderByIdAsc(id).getFirst().getId();
+        txOps.failParticipant(id, owner, row, GlobalTxState.TRYING, "timeout");
+        assertThat(globals.findById(id).orElseThrow().getState()).isEqualTo(GlobalTxState.CANCELLING);
+        assertThat(participants.findById(row).orElseThrow().getState()).isEqualTo(ParticipantTxState.FAILED);
+    }
+
+    @Test
+    void overlappingDriverDoesNotSendRpc() throws Exception {
+        UUID id = seed(GlobalTxState.TRYING);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            entered.countDown();
+            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("driver not released");
+            return null;
+        }).when(participantClient).callTry(argParticipantNamed("inventory"), any());
+        try (var pool = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var first = pool.submit(() -> coordinator.drive(id, null));
+            try {
+                assertThat(entered.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.TRYING);
+                verify(participantClient, times(1)).callTry(any(), any());
+            } finally { release.countDown(); }
+            assertThat(first.get(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(GlobalTxState.CONFIRMED);
+        }
+    }
+
+    @Test
+    void crashAfterRpcBeforeOutcome_isReplayableFromPending() {
+        UUID id = seed(GlobalTxState.TRYING);
+        org.mockito.Mockito.doThrow(new IllegalStateException("simulated process interruption"))
+                .doNothing().when(participantClient).callTry(argParticipantNamed("inventory"), any());
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> coordinator.drive(id, null))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(participants.findByTxIdOrderByIdAsc(id).getFirst().getState()).isEqualTo(ParticipantTxState.PENDING);
+        assertThat(participants.findByTxIdOrderByIdAsc(id).getFirst().getLastAttemptedAt()).isNotNull();
+        assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.CONFIRMED);
     }
 
     private TransactionParticipant argParticipantNamed(String name) {

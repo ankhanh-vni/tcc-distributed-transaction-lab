@@ -19,7 +19,12 @@ public interface GlobalTransactionRepository extends JpaRepository<GlobalTransac
     @Query("select g from GlobalTransaction g where g.txId = :txId")
     Optional<GlobalTransaction> lockById(@Param("txId") UUID txId);
 
-    @Query("select g from GlobalTransaction g where g.state in :states and g.updatedAt < :before order by g.updatedAt asc")
-    List<GlobalTransaction> findStuck(@Param("states") List<GlobalTxState> states,
-                                       @Param("before") OffsetDateTime before);
+    @Query(value = """
+            select * from global_transaction
+            where state in ('STARTED', 'TRYING', 'TRY_FAILED', 'CONFIRMING', 'CANCELLING')
+              and updated_at < clock_timestamp() - (:stuckMs * interval '1 millisecond')
+              and (lease_until is null or lease_until <= clock_timestamp())
+            order by updated_at, tx_id limit :batchSize
+            """, nativeQuery = true)
+    List<GlobalTransaction> findRecoverable(@Param("stuckMs") long stuckMs, @Param("batchSize") int batchSize);
 }

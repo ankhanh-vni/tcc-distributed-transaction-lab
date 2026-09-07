@@ -9,6 +9,7 @@ spring:
     username: ${PAYMENT_DB_USER:payment}
     password: ${PAYMENT_DB_PASS:payment}
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
   flyway:
@@ -18,3 +19,4 @@ spring:
 logging:
   level:
     com.tcc: DEBUG
+

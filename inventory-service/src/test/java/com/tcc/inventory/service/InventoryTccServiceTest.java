@@ -49,6 +49,14 @@ class InventoryTccServiceTest {
     @Autowired ProductRepository products;
     @Autowired InventoryReservationRepository reservations;
 
+    @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
+
+    @org.junit.jupiter.api.BeforeEach
+    void resetDatabase() {
+        jdbc.execute("TRUNCATE inventory_reservation CASCADE");
+        jdbc.execute("update product set available_qty=10, reserved_qty=0, version=0");
+    }
+
     @Test
     void try_reservesStock() {
         var tx = UUID.randomUUID();
@@ -177,5 +185,70 @@ class InventoryTccServiceTest {
         assertThatThrownBy(() -> service.confirm(UUID.randomUUID()))
                 .isInstanceOf(TccException.class)
                 .matches(ex -> ((TccException) ex).getCode() == TccErrorCode.UNKNOWN_TX);
+    }
+
+    @Test
+    void concurrentDuplicateTry_appliesEffectOnce() throws Exception {
+        UUID id = UUID.randomUUID();
+        race(() -> service.tryReserve(id, new ReserveRequest(id, "SKU-A", 1)), () -> service.tryReserve(id, new ReserveRequest(id, "SKU-A", 1)));
+        assertThat(service.getState(id)).isEqualTo(ParticipantState.TRIED);
+        service.cancel(id);
+        var p = products.findBySku("SKU-A").orElseThrow();
+        assertThat(p.getAvailableQty()).isEqualTo(10);
+        assertThat(p.getReservedQty()).isZero();
+    }
+
+    @Test
+    void concurrentTryAndPreventiveCancel_alwaysEndsCancelled() throws Exception {
+        UUID id = UUID.randomUUID();
+        race(() -> {
+            try { return service.tryReserve(id, new ReserveRequest(id, "SKU-A", 1)); }
+            catch (TccException ex) {
+                assertThat(ex.getCode()).isEqualTo(TccErrorCode.CONFIRM_AFTER_CANCEL);
+                return ParticipantState.CANCELLED;
+            }
+        }, () -> service.cancel(id));
+        assertThat(service.getState(id)).isEqualTo(ParticipantState.CANCELLED);
+        var p = products.findBySku("SKU-A").orElseThrow();
+        assertThat(p.getAvailableQty()).isEqualTo(10);
+        assertThat(p.getReservedQty()).isZero();
+    }
+
+    @Test
+    void concurrentConfirmAndCancel_hasExactlyOneTerminalWinner() throws Exception {
+        UUID id = UUID.randomUUID();
+        service.tryReserve(id, new ReserveRequest(id, "SKU-A", 1));
+        var conflicts = new java.util.concurrent.atomic.AtomicInteger();
+        race(() -> {
+            try { return service.confirm(id); }
+            catch (TccException ex) {
+                assertThat(ex.getCode()).isEqualTo(TccErrorCode.CONFIRM_AFTER_CANCEL);
+                conflicts.incrementAndGet(); return ParticipantState.CANCELLED;
+            }
+        }, () -> {
+            try { return service.cancel(id); }
+            catch (TccException ex) {
+                assertThat(ex.getCode()).isEqualTo(TccErrorCode.CANCEL_AFTER_CONFIRM);
+                conflicts.incrementAndGet(); return ParticipantState.CONFIRMED;
+            }
+        });
+        assertThat(conflicts.get()).isEqualTo(1);
+        assertThat(service.getState(id)).isIn(ParticipantState.CONFIRMED, ParticipantState.CANCELLED);
+    }
+
+    private void race(java.util.concurrent.Callable<ParticipantState> a,
+                      java.util.concurrent.Callable<ParticipantState> b) throws Exception {
+        var ready = new java.util.concurrent.CountDownLatch(2);
+        var go = new java.util.concurrent.CountDownLatch(1);
+        try (var pool = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var futures = java.util.stream.Stream.of(a, b).map(task -> pool.submit(() -> {
+                ready.countDown();
+                if (!go.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("start timeout");
+                return task.call();
+            })).toList();
+            try { assertThat(ready.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+            finally { go.countDown(); }
+            for (var future : futures) future.get(10, java.util.concurrent.TimeUnit.SECONDS);
+        }
     }
 }

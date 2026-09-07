@@ -147,4 +147,65 @@ class OrderTccServiceTest {
         assertThat(orders.findById(tx)).isPresent();
         assertThat(orders.findById(tx).get().getState()).isEqualTo(OrderState.CANCELLED);
     }
+
+    @Test
+    void concurrentDuplicateTry_appliesEffectOnce() throws Exception {
+        UUID id = UUID.randomUUID();
+        race(() -> service.tryCreate(id, req(id)), () -> service.tryCreate(id, req(id)));
+        assertThat(service.getState(id)).isEqualTo(ParticipantState.TRIED);
+        service.cancel(id);
+        assertThat(orders.findById(id).orElseThrow().getState()).isEqualTo(OrderState.CANCELLED);
+    }
+
+    @Test
+    void concurrentTryAndPreventiveCancel_alwaysEndsCancelled() throws Exception {
+        UUID id = UUID.randomUUID();
+        race(() -> {
+            try { return service.tryCreate(id, req(id)); }
+            catch (TccException ex) {
+                assertThat(ex.getCode()).isEqualTo(TccErrorCode.CONFIRM_AFTER_CANCEL);
+                return ParticipantState.CANCELLED;
+            }
+        }, () -> service.cancel(id));
+        assertThat(service.getState(id)).isEqualTo(ParticipantState.CANCELLED);
+        assertThat(orders.findById(id).orElseThrow().getState()).isEqualTo(OrderState.CANCELLED);
+    }
+
+    @Test
+    void concurrentConfirmAndCancel_hasExactlyOneTerminalWinner() throws Exception {
+        UUID id = UUID.randomUUID();
+        service.tryCreate(id, req(id));
+        var conflicts = new java.util.concurrent.atomic.AtomicInteger();
+        race(() -> {
+            try { return service.confirm(id); }
+            catch (TccException ex) {
+                assertThat(ex.getCode()).isEqualTo(TccErrorCode.CONFIRM_AFTER_CANCEL);
+                conflicts.incrementAndGet(); return ParticipantState.CANCELLED;
+            }
+        }, () -> {
+            try { return service.cancel(id); }
+            catch (TccException ex) {
+                assertThat(ex.getCode()).isEqualTo(TccErrorCode.CANCEL_AFTER_CONFIRM);
+                conflicts.incrementAndGet(); return ParticipantState.CONFIRMED;
+            }
+        });
+        assertThat(conflicts.get()).isEqualTo(1);
+        assertThat(service.getState(id)).isIn(ParticipantState.CONFIRMED, ParticipantState.CANCELLED);
+    }
+
+    private void race(java.util.concurrent.Callable<ParticipantState> a,
+                      java.util.concurrent.Callable<ParticipantState> b) throws Exception {
+        var ready = new java.util.concurrent.CountDownLatch(2);
+        var go = new java.util.concurrent.CountDownLatch(1);
+        try (var pool = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var futures = java.util.stream.Stream.of(a, b).map(task -> pool.submit(() -> {
+                ready.countDown();
+                if (!go.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("start timeout");
+                return task.call();
+            })).toList();
+            try { assertThat(ready.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+            finally { go.countDown(); }
+            for (var future : futures) future.get(10, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
 }

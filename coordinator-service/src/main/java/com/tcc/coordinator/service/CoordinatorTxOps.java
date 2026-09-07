@@ -2,43 +2,37 @@ package com.tcc.coordinator.service;
 
 import com.tcc.coordinator.api.dto.PlaceOrderRequest;
 import com.tcc.coordinator.config.TccProperties;
-import com.tcc.coordinator.domain.GlobalTransaction;
-import com.tcc.coordinator.domain.GlobalTxState;
-import com.tcc.coordinator.domain.ParticipantTxState;
-import com.tcc.coordinator.domain.TransactionParticipant;
-import com.tcc.coordinator.repo.GlobalTransactionRepository;
-import com.tcc.coordinator.repo.TransactionParticipantRepository;
+import com.tcc.coordinator.domain.*;
+import com.tcc.coordinator.repo.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-
+import java.time.OffsetDateTime;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
-/**
- * Transactional units of work for the coordinator. Pulled into a separate component
- * because Spring's proxy-based @Transactional does not apply to self-invocations.
- */
 @Component
+@Transactional(propagation = Propagation.REQUIRES_NEW)
 public class CoordinatorTxOps {
-
     private static final Logger log = LoggerFactory.getLogger(CoordinatorTxOps.class);
-
     private final GlobalTransactionRepository globals;
     private final TransactionParticipantRepository participants;
     private final TccProperties props;
+    private final JdbcTemplate jdbc;
 
-    public CoordinatorTxOps(GlobalTransactionRepository globals,
-                             TransactionParticipantRepository participants,
-                             TccProperties props) {
+    public CoordinatorTxOps(GlobalTransactionRepository globals, TransactionParticipantRepository participants,
+                            TccProperties props, JdbcTemplate jdbc) {
         this.globals = globals;
         this.participants = participants;
         this.props = props;
+        this.jdbc = jdbc;
     }
 
-    @Transactional
     public void seedTransaction(UUID txId, PlaceOrderRequest req,
                                  BiFunction<UUID, String, String> payloadFor) {
         var businessKey = "order:" + req.customerId() + ":" + req.sku();
@@ -58,38 +52,104 @@ public class CoordinatorTxOps {
         log.info("[seed] tx={} business={} participants=3", txId, businessKey);
     }
 
-    @Transactional
-    public GlobalTxState transitionStartedToTrying(UUID txId) {
+
+    public boolean acquire(UUID txId, UUID token) {
         var g = globals.lockById(txId).orElseThrow();
-        if (g.getState() == GlobalTxState.STARTED) {
-            g.setState(GlobalTxState.TRYING);
-            log.info("[state] tx={} STARTED -> TRYING", txId);
-        }
-        return g.getState();
+        var now = now();
+        if (g.getState().isTerminal() || (g.getLeaseUntil() != null && g.getLeaseUntil().isAfter(now))) return false;
+        g.lease(token, now.plusNanos(props.getRecovery().getLeaseMs() * 1_000_000));
+        g.incrementAttempt();
+        return true;
     }
 
-    @Transactional
-    public GlobalTxState transitionGlobal(UUID txId, GlobalTxState target, String error) {
+    public void release(UUID txId, UUID token) {
         var g = globals.lockById(txId).orElseThrow();
-        log.info("[state] tx={} {} -> {}", txId, g.getState(), target);
+        if (token.equals(g.getDriverToken())) g.lease(null, null);
+    }
+
+    private OffsetDateTime now() {
+        return jdbc.queryForObject("select clock_timestamp()", OffsetDateTime.class);
+    }
+
+    private GlobalTransaction owned(UUID txId, UUID token) {
+        var g = globals.lockById(txId).orElseThrow();
+        var now = now();
+        if (!token.equals(g.getDriverToken()) || g.getLeaseUntil() == null || !g.getLeaseUntil().isAfter(now)) {
+            throw new StaleDriverException();
+        }
+        g.lease(token, now.plusNanos(props.getRecovery().getLeaseMs() * 1_000_000));
+        return g;
+    }
+
+    public GlobalTxState transitionGlobal(UUID txId, UUID token, GlobalTxState target, String error) {
+        var g = owned(txId, token);
+        if (target == GlobalTxState.CONFIRMING) requireParticipants(txId, ParticipantTxState.TRIED);
+        if (target == GlobalTxState.CONFIRMED) requireParticipants(txId, ParticipantTxState.CONFIRMED);
+        if (target == GlobalTxState.CANCELLED) requireParticipants(txId, ParticipantTxState.CANCELLED);
+        return transition(g, target, error);
+    }
+
+    private void requireParticipants(UUID txId, ParticipantTxState state) {
+        var ps = participants.findByTxIdOrderByIdAsc(txId);
+        if (ps.size() != 3 || !ps.stream().map(TransactionParticipant::getParticipant).collect(Collectors.toSet())
+                .equals(Set.of("inventory", "payment", "order")) || ps.stream().anyMatch(p -> p.getState() != state)) {
+            throw new IllegalStateException("Incomplete participant outcome for " + state);
+        }
+    }
+
+    private GlobalTxState transition(GlobalTransaction g, GlobalTxState target, String error) {
+        if (!g.getState().canTransitionTo(target)) {
+            throw new IllegalStateException("Illegal global transition " + g.getState() + " -> " + target);
+        }
+        log.info("[state] tx={} {} -> {}", g.getTxId(), g.getState(), target);
         g.setState(target);
-        if (error != null) g.setLastError(error);
-        g.incrementAttempt();
+        g.setLastError(error);
         return target;
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void markParticipant(Long participantRowId, ParticipantTxState state, String error) {
-        var p = participants.findById(participantRowId).orElseThrow();
+    private TransactionParticipant participant(UUID txId, Long id) {
+        var p = participants.findById(id).orElseThrow();
+        if (!txId.equals(p.getTxId())) throw new IllegalArgumentException("Participant belongs to another transaction");
+        return p;
+    }
+
+    private void requirePhase(GlobalTransaction g, GlobalTxState phase) {
+        if (g.getState() != phase || !phase.isInFlight()) throw new StaleDriverException();
+    }
+
+    // Committed before RPC; also renews ownership without holding a DB transaction over HTTP.
+    public void beforeCall(UUID txId, UUID token, Long id, GlobalTxState phase) {
+        requirePhase(owned(txId, token), phase);
+        participant(txId, id).markAttempted();
+    }
+
+    public void markParticipant(UUID txId, UUID token, Long id, GlobalTxState phase,
+                                ParticipantTxState state, String error) {
+        requirePhase(owned(txId, token), phase);
+        var p = participant(txId, id);
+        boolean valid = switch (phase) {
+            case TRYING -> p.getState() == ParticipantTxState.PENDING && state == ParticipantTxState.TRIED;
+            case CONFIRMING -> p.getState() == ParticipantTxState.TRIED && state == ParticipantTxState.CONFIRMED;
+            case CANCELLING -> p.getState() != ParticipantTxState.CONFIRMED && state == ParticipantTxState.CANCELLED;
+            default -> false;
+        };
+        if (!valid) throw new IllegalStateException("Illegal participant transition " + p.getState() + " -> " + state);
         p.setState(state);
-        p.markAttempted();
         p.setLastError(error);
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void markParticipantAttempted(Long participantRowId, String error) {
-        var p = participants.findById(participantRowId).orElseThrow();
-        p.markAttempted();
+    public void markParticipantAttempted(UUID txId, UUID token, Long id, GlobalTxState phase, String error) {
+        requirePhase(owned(txId, token), phase);
+        participant(txId, id).setLastError(error);
+    }
+
+    // Failure evidence and the durable decision must commit or roll back together.
+    public GlobalTxState failParticipant(UUID txId, UUID token, Long id, GlobalTxState phase, String error) {
+        var g = owned(txId, token);
+        requirePhase(g, phase);
+        var p = participant(txId, id);
+        p.setState(ParticipantTxState.FAILED);
         p.setLastError(error);
+        return transition(g, phase == GlobalTxState.TRYING ? GlobalTxState.CANCELLING : GlobalTxState.HEURISTIC, error);
     }
 }

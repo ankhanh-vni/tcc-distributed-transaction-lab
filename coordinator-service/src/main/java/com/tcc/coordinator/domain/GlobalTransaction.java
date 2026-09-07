@@ -48,6 +48,16 @@ public class GlobalTransaction {
         this.state = state;
     }
 
+    @Column(name = "driver_token")
+    private UUID driverToken;
+
+    @Column(name = "lease_until")
+    private OffsetDateTime leaseUntil;
+
+    public UUID getDriverToken() { return driverToken; }
+    public OffsetDateTime getLeaseUntil() { return leaseUntil; }
+    public void lease(UUID token, OffsetDateTime until) { driverToken = token; leaseUntil = until; }
+
     @PrePersist
     void onInsert() {
         OffsetDateTime now = OffsetDateTime.now();

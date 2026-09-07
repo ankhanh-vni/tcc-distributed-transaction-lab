@@ -10,7 +10,8 @@ import com.tcc.inventory.repo.InventoryReservationRepository;
 import com.tcc.inventory.repo.ProductRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,6 +19,17 @@ import java.util.UUID;
 
 @Service
 public class InventoryTccService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    // Row locks cannot protect a missing txId. The transaction-scoped lock covers
+    // the first read through commit, including preventive Cancel and concurrent Try.
+    private void lockTransaction(UUID txId) {
+        long key = txId.getMostSignificantBits() ^ txId.getLeastSignificantBits();
+        entityManager.createNativeQuery("select 1 from pg_advisory_xact_lock(:key)")
+                .setParameter("key", key).getSingleResult();
+    }
 
     private static final Logger log = LoggerFactory.getLogger(InventoryTccService.class);
 
@@ -34,6 +46,7 @@ public class InventoryTccService {
      */
     @Transactional
     public ParticipantState tryReserve(UUID txId, ReserveRequest req) {
+        lockTransaction(txId);
         var existing = reservations.lockById(txId);
         if (existing.isPresent()) {
             return switch (existing.get().getState()) {
@@ -47,14 +60,7 @@ public class InventoryTccService {
                 .orElseThrow(() -> new TccException(TccErrorCode.BUSINESS_PRECONDITION_FAILED,
                         "unknown sku=" + req.sku()));
         product.reserve(req.qty());
-        try {
-            reservations.save(new InventoryReservation(txId, product.getId(), req.qty(), ParticipantState.TRIED));
-        } catch (DataIntegrityViolationException duplicate) {
-            // Concurrent retry won the race; re-read and treat as idempotent.
-            var winner = reservations.lockById(txId).orElseThrow();
-            log.info("[try] concurrent retry resolved: tx={} state={}", txId, winner.getState());
-            return winner.getState();
-        }
+        reservations.save(new InventoryReservation(txId, product.getId(), req.qty(), ParticipantState.TRIED));
         log.info("[try] reserved sku={} qty={} tx={}", req.sku(), req.qty(), txId);
         return ParticipantState.TRIED;
     }
@@ -64,6 +70,7 @@ public class InventoryTccService {
      */
     @Transactional
     public ParticipantState confirm(UUID txId) {
+        lockTransaction(txId);
         var existing = reservations.lockById(txId)
                 .orElseThrow(() -> new TccException(TccErrorCode.UNKNOWN_TX,
                         "cannot confirm unknown tx=" + txId));
@@ -74,7 +81,7 @@ public class InventoryTccService {
                 throw new TccException(TccErrorCode.CONFIRM_AFTER_CANCEL,
                         "Confirm after Cancel: tx=" + txId);
             case TRIED:
-                Product product = products.findById(existing.getProductId()).orElseThrow();
+                Product product = products.lockById(existing.getProductId()).orElseThrow();
                 product.confirmReservation(existing.getQty());
                 existing.setState(ParticipantState.CONFIRMED);
                 log.info("[confirm] tx={} sku={} qty={}", txId, product.getSku(), existing.getQty());
@@ -91,19 +98,11 @@ public class InventoryTccService {
      */
     @Transactional
     public ParticipantState cancel(UUID txId) {
+        lockTransaction(txId);
         var existing = reservations.lockById(txId);
         if (existing.isEmpty()) {
-            try {
-                reservations.save(new InventoryReservation(txId, /*productId*/ null, 0, ParticipantState.CANCELLED));
-                log.info("[cancel] preventive tombstone written tx={}", txId);
-            } catch (DataIntegrityViolationException race) {
-                var racer = reservations.lockById(txId).orElseThrow();
-                if (racer.getState() == ParticipantState.CONFIRMED) {
-                    throw new TccException(TccErrorCode.CANCEL_AFTER_CONFIRM,
-                            "Cancel after Confirm: tx=" + txId);
-                }
-                return racer.getState();
-            }
+            reservations.save(new InventoryReservation(txId, /*productId*/ null, 0, ParticipantState.CANCELLED));
+            log.info("[cancel] preventive tombstone written tx={}", txId);
             return ParticipantState.CANCELLED;
         }
         switch (existing.get().getState()) {
@@ -113,7 +112,7 @@ public class InventoryTccService {
                 throw new TccException(TccErrorCode.CANCEL_AFTER_CONFIRM,
                         "Cancel after Confirm: tx=" + txId);
             case TRIED:
-                Product product = products.findById(existing.get().getProductId()).orElseThrow();
+                Product product = products.lockById(existing.get().getProductId()).orElseThrow();
                 product.releaseReservation(existing.get().getQty());
                 existing.get().setState(ParticipantState.CANCELLED);
                 log.info("[cancel] released sku={} qty={} tx={}", product.getSku(), existing.get().getQty(), txId);

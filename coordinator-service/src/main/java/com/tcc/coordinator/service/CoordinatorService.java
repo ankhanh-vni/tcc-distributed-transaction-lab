@@ -16,7 +16,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -77,17 +76,22 @@ public class CoordinatorService {
      * Safe to call repeatedly (recovery uses this same method, with no injections).
      */
     public GlobalTxState drive(UUID txId, String injectFailHeader, String injectConfirmSleepMillis) {
-        GlobalTxState state = tx.transitionStartedToTrying(txId);
-        if (state == GlobalTxState.TRYING) {
-            state = runTryPhase(txId, injectFailHeader);
+        UUID token = UUID.randomUUID();
+        if (!tx.acquire(txId, token)) return findTransaction(txId).getState();
+        try {
+            GlobalTxState state = findTransaction(txId).getState();
+            if (state == GlobalTxState.STARTED) state = tx.transitionGlobal(txId, token, GlobalTxState.TRYING, null);
+            if (state == GlobalTxState.TRY_FAILED) state = tx.transitionGlobal(txId, token, GlobalTxState.CANCELLING, "Recovered failed Try");
+            if (state == GlobalTxState.TRYING) state = runTryPhase(txId, token, injectFailHeader);
+            if (state == GlobalTxState.CONFIRMING) state = runConfirmPhase(txId, token, injectConfirmSleepMillis);
+            if (state == GlobalTxState.CANCELLING) state = runCancelPhase(txId, token);
+            return state;
+        } catch (StaleDriverException ex) {
+            log.info("[drive] lease lost tx={}; discarding stale result", txId);
+            return findTransaction(txId).getState();
+        } finally {
+            tx.release(txId, token);
         }
-        if (state == GlobalTxState.CONFIRMING) {
-            state = runConfirmPhase(txId, injectConfirmSleepMillis);
-        }
-        if (state == GlobalTxState.CANCELLING) {
-            state = runCancelPhase(txId);
-        }
-        return state;
     }
 
     /**
@@ -95,8 +99,15 @@ public class CoordinatorService {
      * On success of all, transition to CONFIRMING. Each per-participant outcome is persisted
      * before continuing.
      */
-    private GlobalTxState runTryPhase(UUID txId, String injectFailHeader) {
+    private GlobalTxState runTryPhase(UUID txId, UUID token, String injectFailHeader) {
         var ps = participants.findByTxIdOrderByIdAsc(txId);
+        if (!completeRegistration(ps)) return tx.transitionGlobal(txId, token, GlobalTxState.HEURISTIC, "Incomplete participant log");
+        if (ps.stream().anyMatch(p -> p.getState() == ParticipantTxState.CONFIRMED)) {
+            return tx.transitionGlobal(txId, token, GlobalTxState.HEURISTIC, "Confirmed participant before Confirm decision");
+        }
+        if (ps.stream().anyMatch(p -> p.getState() == ParticipantTxState.FAILED || p.getState() == ParticipantTxState.CANCELLED)) {
+            return tx.transitionGlobal(txId, token, GlobalTxState.CANCELLING, "Recovered unsuccessful Try");
+        }
         for (var p : ps) {
             if (p.getState() == ParticipantTxState.TRIED) {
                 continue; // recovery resuming after crash
@@ -105,15 +116,15 @@ public class CoordinatorService {
                 continue;
             }
             try {
+                tx.beforeCall(txId, token, p.getId(), GlobalTxState.TRYING);
                 client.callTry(p, injectFailHeader);
-                tx.markParticipant(p.getId(), ParticipantTxState.TRIED, null);
+                tx.markParticipant(txId, token, p.getId(), GlobalTxState.TRYING, ParticipantTxState.TRIED, null);
             } catch (ParticipantCallException ex) {
                 log.warn("[try] failed participant={} status={} cause={}", p.getParticipant(), ex.getHttpStatus(), ex.getMessage());
-                tx.markParticipant(p.getId(), ParticipantTxState.FAILED, summarize(ex));
-                return tx.transitionGlobal(txId, GlobalTxState.CANCELLING, summarize(ex));
+                return tx.failParticipant(txId, token, p.getId(), GlobalTxState.TRYING, summarize(ex));
             }
         }
-        return tx.transitionGlobal(txId, GlobalTxState.CONFIRMING, null);
+        return tx.transitionGlobal(txId, token, GlobalTxState.CONFIRMING, null);
     }
 
     /**
@@ -121,8 +132,11 @@ public class CoordinatorService {
      * cause cancellation: recovery will retry the same participants until they succeed
      * (the only way out of CONFIRMING is CONFIRMED, modulo HEURISTIC).
      */
-    private GlobalTxState runConfirmPhase(UUID txId, String injectConfirmSleepMillis) {
+    private GlobalTxState runConfirmPhase(UUID txId, UUID token, String injectConfirmSleepMillis) {
         var ps = participants.findByTxIdOrderByIdAsc(txId);
+        if (!completeRegistration(ps) || ps.stream().anyMatch(p -> p.getState() != ParticipantTxState.TRIED && p.getState() != ParticipantTxState.CONFIRMED)) {
+            return tx.transitionGlobal(txId, token, GlobalTxState.HEURISTIC, "Inconsistent Confirm log");
+        }
         boolean allConfirmed = true;
         for (var p : ps) {
             if (p.getState() == ParticipantTxState.CONFIRMED) continue;
@@ -131,22 +145,22 @@ public class CoordinatorService {
                 continue;
             }
             try {
+                tx.beforeCall(txId, token, p.getId(), GlobalTxState.CONFIRMING);
                 client.callConfirm(p, injectConfirmSleepMillis);
-                tx.markParticipant(p.getId(), ParticipantTxState.CONFIRMED, null);
+                tx.markParticipant(txId, token, p.getId(), GlobalTxState.CONFIRMING, ParticipantTxState.CONFIRMED, null);
             } catch (ParticipantCallException ex) {
                 if (ex.isConflict()) {
-                    tx.markParticipant(p.getId(), ParticipantTxState.FAILED, summarize(ex));
-                    return tx.transitionGlobal(txId, GlobalTxState.HEURISTIC,
-                            "Confirm rejected with 409 by " + p.getParticipant());
+                    return tx.failParticipant(txId, token, p.getId(), GlobalTxState.CONFIRMING,
+                            "Confirm rejected with 409 by " + p.getParticipant() + ": " + summarize(ex));
                 }
                 log.warn("[confirm] failed (will retry via recovery) participant={} cause={}",
                         p.getParticipant(), ex.getMessage());
-                tx.markParticipantAttempted(p.getId(), summarize(ex));
+                tx.markParticipantAttempted(txId, token, p.getId(), GlobalTxState.CONFIRMING, summarize(ex));
                 allConfirmed = false;
             }
         }
         if (allConfirmed) {
-            return tx.transitionGlobal(txId, GlobalTxState.CONFIRMED, null);
+            return tx.transitionGlobal(txId, token, GlobalTxState.CONFIRMED, null);
         }
         return GlobalTxState.CONFIRMING;
     }
@@ -155,30 +169,38 @@ public class CoordinatorService {
      * Phase 2b — Cancel. Drive every participant to CANCELLED, including PENDING ones
      * (preventive cancel — closes the race window where a slow Try arrives after we decide to cancel).
      */
-    private GlobalTxState runCancelPhase(UUID txId) {
+    private GlobalTxState runCancelPhase(UUID txId, UUID token) {
         var ps = participants.findByTxIdOrderByIdAsc(txId);
+        if (!completeRegistration(ps) || ps.stream().anyMatch(p -> p.getState() == ParticipantTxState.CONFIRMED)) {
+            return tx.transitionGlobal(txId, token, GlobalTxState.HEURISTIC, "Inconsistent Cancel log");
+        }
         boolean allCancelled = true;
         for (var p : ps) {
             if (p.getState() == ParticipantTxState.CANCELLED) continue;
             try {
+                tx.beforeCall(txId, token, p.getId(), GlobalTxState.CANCELLING);
                 client.callCancel(txId, p);
-                tx.markParticipant(p.getId(), ParticipantTxState.CANCELLED, null);
+                tx.markParticipant(txId, token, p.getId(), GlobalTxState.CANCELLING, ParticipantTxState.CANCELLED, null);
             } catch (ParticipantCallException ex) {
                 if (ex.isConflict()) {
-                    tx.markParticipant(p.getId(), ParticipantTxState.FAILED, summarize(ex));
-                    return tx.transitionGlobal(txId, GlobalTxState.HEURISTIC,
-                            "Cancel rejected with 409 by " + p.getParticipant());
+                    return tx.failParticipant(txId, token, p.getId(), GlobalTxState.CANCELLING,
+                            "Cancel rejected with 409 by " + p.getParticipant() + ": " + summarize(ex));
                 }
                 log.warn("[cancel] failed (will retry via recovery) participant={} cause={}",
                         p.getParticipant(), ex.getMessage());
-                tx.markParticipantAttempted(p.getId(), summarize(ex));
+                tx.markParticipantAttempted(txId, token, p.getId(), GlobalTxState.CANCELLING, summarize(ex));
                 allCancelled = false;
             }
         }
         if (allCancelled) {
-            return tx.transitionGlobal(txId, GlobalTxState.CANCELLED, null);
+            return tx.transitionGlobal(txId, token, GlobalTxState.CANCELLED, null);
         }
         return GlobalTxState.CANCELLING;
+    }
+
+    private boolean completeRegistration(List<TransactionParticipant> ps) {
+        return ps.size() == 3 && ps.stream().map(TransactionParticipant::getParticipant)
+                .collect(java.util.stream.Collectors.toSet()).equals(java.util.Set.of("inventory", "payment", "order"));
     }
 
     private String payloadFor(UUID txId, String participant, PlaceOrderRequest req) {
@@ -191,13 +213,13 @@ public class CoordinatorService {
             }
             case "payment" -> {
                 body.put("customerId", req.customerId());
-                body.put("amount", req.amount().setScale(2, java.math.RoundingMode.HALF_UP));
+                body.put("amount", req.amount().setScale(2, java.math.RoundingMode.UNNECESSARY));
             }
             case "order" -> {
                 body.put("customerId", req.customerId());
                 body.put("sku", req.sku());
                 body.put("qty", req.qty());
-                body.put("amount", req.amount().setScale(2, java.math.RoundingMode.HALF_UP));
+                body.put("amount", req.amount().setScale(2, java.math.RoundingMode.UNNECESSARY));
             }
             default -> throw new IllegalArgumentException("unknown participant: " + participant);
         }

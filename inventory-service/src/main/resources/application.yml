@@ -9,6 +9,7 @@ spring:
     username: ${INVENTORY_DB_USER:inventory}
     password: ${INVENTORY_DB_PASS:inventory}
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
     properties:
@@ -20,3 +21,4 @@ spring:
 logging:
   level:
     com.tcc: DEBUG
+
