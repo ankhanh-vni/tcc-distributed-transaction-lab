@@ -27,7 +27,7 @@ Reviewed baseline: `516d9ff5411c32e1ebca44d8b3209b2127b7d7b4` (main). Scope: all
 
 ## Follow-up limitations
 
-- POST /api/orders has no client idempotency key: a caller retry after a lost response creates a different txId and may place another order. Adding a key requires a documented API contract, request fingerprint and retention policy; participant txId idempotency does not solve this.
+- Client retry safety is now implemented with the optional `Idempotency-Key` header, a durable request fingerprint and atomic key/log creation (V3). See README for the contract. Calls without the header still create a new order on every submission. Keys do not automatically expire.
 - Lab endpoints, seeded passwords and failure injection are deliberately exposed for exercises. This change does not add authentication or make the lab deployable as a banking service. Failure injection should be disabled and endpoints isolated outside local exercises.
 - HEURISTIC still needs human reconciliation; this change never automatically retries it. Tombstone/log retention must account for arbitrarily delayed messages before any cleanup is introduced.
 - Bounded fixed-delay recovery is not exponential backoff, a transaction deadline or an operator work queue. Persistent unavailable participants remain pending for recovery.
@@ -47,3 +47,7 @@ The V2 migrations add resource version columns and coordinator lease columns. Op
 Initial repair commit `998c92eccadba37e1819cf955906c313af0b34ad` passed GitHub Actions [run 34091147236](https://github.com/ankhanh-vni/tcc-distributed-transaction-lab/actions/runs/34091147236): all modules packaged; 77 tests passed, zero failures/errors/skips; all 11 required PostgreSQL/Compose integration suites ran. The subsequent revision adds explicit database-commit rollback and bounded recovery scan checks. Its result is tracked by the PR checks.
 
 Local verification parsed all Maven XML and YAML, passed `git diff --check`, and confirmed that the report gate rejects missing integration reports. Java/Maven/Docker execution occurred on GitHub's runner because this workspace lacks those working runtimes. This is functional and concurrent regression coverage, not a load test, exhaustive fault-injection proof, dependency vulnerability audit, or production security certification.
+
+## Client idempotency follow-up
+
+Added per-order client keys with an exact canonical fingerprint covering customer, SKU, quantity and normalized amount. PostgreSQL serializes first use of each key across coordinator instances. The key mapping, global row and participant rows commit together; no duplicate-insert recovery is attempted inside a failed transaction. A conflicting request returns HTTP 409; a matching retry resumes or returns the existing transaction through the guarded driver. Terminal results retain their keys. Eleven added tests cover HTTP validation/conflicts, equivalent amounts, changed fields, distinct keys, cancellation, in-flight retries, crash-after-seed, seed rollback and real concurrent HTTP requests with one stock decrement, one charge and one order. CI requires the new Compose suite to execute.

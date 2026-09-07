@@ -39,8 +39,9 @@ public class OrderController {
     public ResponseEntity<TransactionStatusResponse> placeOrder(
             @Valid @RequestBody PlaceOrderRequest request,
             @RequestHeader(value = INJECT_FAIL_HEADER, required = false) String injectFailHeader,
-            @RequestHeader(value = INJECT_CONFIRM_SLEEP_HEADER, required = false) String injectConfirmSleep) {
-        UUID txId = coordinator.placeOrder(request, injectFailHeader, injectConfirmSleep);
+            @RequestHeader(value = INJECT_CONFIRM_SLEEP_HEADER, required = false) String injectConfirmSleep,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+        UUID txId = coordinator.placeOrder(request, injectFailHeader, injectConfirmSleep, idempotencyKey);
         return ResponseEntity.ok(buildStatus(txId));
     }
 
@@ -57,3 +58,4 @@ public class OrderController {
         return new TransactionStatusResponse(g.getTxId(), g.getState(), g.getAttemptCount(), g.getLastError(), participants);
     }
 }
+

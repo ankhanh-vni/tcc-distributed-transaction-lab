@@ -53,6 +53,36 @@ public class CoordinatorTxOps {
     }
 
 
+    public record SeedResult(UUID txId, boolean created) {}
+
+    public SeedResult seedOrGet(String key, String fingerprint, PlaceOrderRequest req,
+                                BiFunction<UUID, String, String> payloadFor) {
+        if (key != null) {
+            // Serialize absent-key creation across coordinator instances. A hash
+            // collision only serializes unrelated keys; equality uses the full key.
+            jdbc.queryForObject("select 1 from pg_advisory_xact_lock(27182, hashtext(?))", Integer.class, key);
+            var existing = jdbc.query("select tx_id, request_fingerprint from order_idempotency where idempotency_key=?",
+                    (rs, row) -> new StoredRequest(rs.getObject("tx_id", UUID.class), rs.getString("request_fingerprint")), key);
+            if (!existing.isEmpty()) {
+                var stored = existing.getFirst();
+                if (!stored.fingerprint().equals(fingerprint)) throw new IdempotencyConflictException();
+                return new SeedResult(stored.txId(), false);
+            }
+        }
+        UUID txId = UUID.randomUUID();
+        // Intentional self-call: creation and key reservation belong to this same
+        // REQUIRES_NEW transaction, with no RPC until it has committed.
+        seedTransaction(txId, req, payloadFor);
+        if (key != null) {
+            globals.flush();
+            jdbc.update("insert into order_idempotency(idempotency_key, request_fingerprint, tx_id) values (?, ?, ?)",
+                    key, fingerprint, txId);
+        }
+        return new SeedResult(txId, true);
+    }
+
+    private record StoredRequest(UUID txId, String fingerprint) {}
+
     public boolean acquire(UUID txId, UUID token) {
         var g = globals.lockById(txId).orElseThrow();
         var now = now();

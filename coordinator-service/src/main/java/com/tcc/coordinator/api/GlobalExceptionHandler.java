@@ -10,9 +10,17 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
+    @ExceptionHandler(com.tcc.coordinator.service.IdempotencyConflictException.class)
+    public ResponseEntity<java.util.Map<String, String>> handleIdempotencyConflict(
+            com.tcc.coordinator.service.IdempotencyConflictException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(java.util.Map.of("code", "IDEMPOTENCY_KEY_REUSED", "message", ex.getMessage()));
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<TccErrorResponse> handleNotFound(IllegalArgumentException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(new TccErrorResponse(TccErrorCode.UNKNOWN_TX, ex.getMessage()));
     }
 }
+

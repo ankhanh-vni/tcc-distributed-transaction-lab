@@ -6,7 +6,7 @@ required = {
     'InventoryTccServiceTest', 'PaymentTccServiceTest', 'OrderTccServiceTest',
     'CoordinatorServiceTest', 'RecoveryServiceTest', 'HappyPathTest',
     'IdempotencyTest', 'PaymentTryFailsTest', 'TerminalStateGuardTest',
-    'ConfirmTimeoutRecoveryTest', 'CoordinatorCrashRecoveryTest',
+    'ConfirmTimeoutRecoveryTest', 'CoordinatorCrashRecoveryTest', 'ClientIdempotencyTest',
 }
 seen = set()
 for path in Path('.').glob('*/target/surefire-reports/TEST-*.xml'):

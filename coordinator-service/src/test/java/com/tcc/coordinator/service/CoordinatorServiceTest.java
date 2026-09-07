@@ -41,6 +41,7 @@ import static org.mockito.Mockito.verify;
  */
 @Testcontainers
 @SpringBootTest
+@org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
 @EnabledIf("dockerAvailable")
 class CoordinatorServiceTest {
 
@@ -328,6 +329,119 @@ class CoordinatorServiceTest {
         } finally {
             jdbc.execute("alter table global_transaction drop constraint test_reject_cancel");
         }
+    }
+
+    @Autowired org.springframework.test.web.servlet.MockMvc mvc;
+
+    @Test
+    void matchingKeyReusesTransactionWithEquivalentMoney() {
+        UUID first = coordinator.placeOrder(sampleOrder(), null, null, "order-1");
+        var equivalent = new PlaceOrderRequest("CUST-1", "SKU-A", 1, new BigDecimal("100"));
+        UUID retry = coordinator.placeOrder(equivalent, "TRY", "8000", "order-1");
+        assertThat(retry).isEqualTo(first);
+        assertThat(globals.count()).isEqualTo(1);
+        assertThat(participants.count()).isEqualTo(3);
+        verify(participantClient, times(3)).callTry(any(), any());
+        verify(participantClient, times(3)).callConfirm(any(), any());
+    }
+
+    @Test
+    void keyReuseRejectsChangesToEveryBusinessField() {
+        coordinator.placeOrder(sampleOrder(), null, null, "order-1");
+        for (var changed : java.util.List.of(
+                new PlaceOrderRequest("CUST-2", "SKU-A", 1, new BigDecimal("100.00")),
+                new PlaceOrderRequest("CUST-1", "SKU-B", 1, new BigDecimal("100.00")),
+                new PlaceOrderRequest("CUST-1", "SKU-A", 2, new BigDecimal("100.00")),
+                new PlaceOrderRequest("CUST-1", "SKU-A", 1, new BigDecimal("101.00")))) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> coordinator.placeOrder(changed, null, null, "order-1"))
+                    .isInstanceOf(IdempotencyConflictException.class);
+        }
+        assertThat(globals.count()).isEqualTo(1);
+        verify(participantClient, times(3)).callTry(any(), any());
+    }
+
+    @Test
+    void distinctKeysAllowIntentionalIdenticalOrders() {
+        UUID first = coordinator.placeOrder(sampleOrder(), null, null, "order-1");
+        UUID second = coordinator.placeOrder(sampleOrder(), null, null, "order-2");
+        assertThat(second).isNotEqualTo(first);
+        assertThat(globals.count()).isEqualTo(2);
+    }
+
+    @Test
+    void cancelledTransactionKeepsItsKey() {
+        doThrow(new ParticipantCallException("inventory", "TRY", 500, "failure", null))
+                .when(participantClient).callTry(any(), any());
+        UUID first = coordinator.placeOrder(sampleOrder(), null, null, "cancelled-order");
+        org.mockito.Mockito.clearInvocations(participantClient);
+        assertThat(coordinator.placeOrder(sampleOrder(), null, null, "cancelled-order")).isEqualTo(first);
+        assertThat(globals.findById(first).orElseThrow().getState()).isEqualTo(GlobalTxState.CANCELLED);
+        org.mockito.Mockito.verifyNoInteractions(participantClient);
+    }
+
+    @Test
+    void concurrentKeyRetriesShareAnActiveTransaction() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            entered.countDown();
+            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release timeout");
+            return null;
+        }).when(participantClient).callTry(argParticipantNamed("inventory"), any());
+        try (var pool = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var first = pool.submit(() -> coordinator.placeOrder(sampleOrder(), null, null, "concurrent-key"));
+            UUID retry;
+            try {
+                assertThat(entered.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                retry = coordinator.placeOrder(sampleOrder(), null, null, "concurrent-key");
+                assertThat(globals.count()).isEqualTo(1);
+                assertThat(globals.findById(retry).orElseThrow().getState()).isEqualTo(GlobalTxState.TRYING);
+                verify(participantClient, times(1)).callTry(any(), any());
+            } finally { release.countDown(); }
+            assertThat(first.get(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(retry);
+        }
+    }
+
+    @Test
+    void crashAfterSeedCommit_retryResumesSameTransaction() throws Exception {
+        String fingerprint = new com.fasterxml.jackson.databind.ObjectMapper()
+                .writeValueAsString(java.util.List.of("CUST-1", "SKU-A", 1, "100.00"));
+        UUID seeded = txOps.seedOrGet("crash-key", fingerprint, sampleOrder(), (id, name) -> "{}").txId();
+        assertThat(globals.findById(seeded).orElseThrow().getState()).isEqualTo(GlobalTxState.STARTED);
+        assertThat(coordinator.placeOrder(sampleOrder(), null, null, "crash-key")).isEqualTo(seeded);
+        assertThat(globals.findById(seeded).orElseThrow().getState()).isEqualTo(GlobalTxState.CONFIRMED);
+        assertThat(globals.count()).isEqualTo(1);
+    }
+
+    @Test
+    void failedSeedRollsBackKeyAndPartialParticipantLog() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> txOps.seedOrGet("rollback-key", "fingerprint", sampleOrder(),
+                (id, name) -> { if (name.equals("payment")) throw new IllegalStateException("seed interrupted"); return "{}"; }))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(globals.count()).isZero();
+        assertThat(participants.count()).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from order_idempotency", Long.class)).isZero();
+        coordinator.placeOrder(sampleOrder(), null, null, "rollback-key");
+        assertThat(globals.count()).isEqualTo(1);
+    }
+
+    @Test
+    void httpRejectsInvalidKeyAndConflictingPayload() throws Exception {
+        String body = "{\"customerId\":\"CUST-1\",\"sku\":\"SKU-A\",\"qty\":1,\"amount\":100.00}";
+        for (String key : java.util.List.of("", "has spaces", "x".repeat(129))) {
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/orders")
+                    .contentType("application/json").header("Idempotency-Key", key).content(body))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest());
+        }
+        assertThat(globals.count()).isZero();
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/orders")
+                .contentType("application/json").header("Idempotency-Key", "http-key").content(body))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/orders")
+                .contentType("application/json").header("Idempotency-Key", "http-key").content(body.replace("100.00", "101.00")))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isConflict())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.code").value("IDEMPOTENCY_KEY_REUSED"));
+        assertThat(globals.count()).isEqualTo(1);
     }
 
     private TransactionParticipant argParticipantNamed(String name) {

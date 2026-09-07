@@ -61,10 +61,32 @@ public class CoordinatorService {
     }
 
     public UUID placeOrder(PlaceOrderRequest req, String injectFailHeader, String injectConfirmSleepMillis) {
-        UUID txId = UUID.randomUUID();
-        tx.seedTransaction(txId, req, (id, name) -> payloadFor(id, name, req));
-        drive(txId, injectFailHeader, injectConfirmSleepMillis);
-        return txId;
+        return placeOrder(req, injectFailHeader, injectConfirmSleepMillis, null);
+    }
+
+    public UUID placeOrder(PlaceOrderRequest req, String injectFailHeader, String injectConfirmSleepMillis,
+                           String idempotencyKey) {
+        if (idempotencyKey != null && !idempotencyKey.matches("[A-Za-z0-9._:-]{1,128}")) {
+            throw new org.springframework.web.server.ResponseStatusException(org.springframework.http.HttpStatus.BAD_REQUEST,
+                    "Idempotency-Key must contain 1..128 letters, digits, '.', '_', ':' or '-'");
+        }
+        var seed = tx.seedOrGet(idempotencyKey, idempotencyKey == null ? null : fingerprint(req), req,
+                (id, name) -> payloadFor(id, name, req));
+        // Replays may resume an abandoned transaction, but never reapply fault-injection headers.
+        drive(seed.txId(), seed.created() ? injectFailHeader : null,
+                seed.created() ? injectConfirmSleepMillis : null);
+        return seed.txId();
+    }
+
+    private String fingerprint(PlaceOrderRequest req) {
+        try {
+            // Fixed field order and exact money normalization make JSON field order
+            // and values such as 100, 100.0 and 100.00 equivalent without ambiguous concatenation.
+            return json.writeValueAsString(List.of(req.customerId(), req.sku(), req.qty(),
+                    req.amount().setScale(2, java.math.RoundingMode.UNNECESSARY).toPlainString()));
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Could not fingerprint order", ex);
+        }
     }
 
     public GlobalTxState drive(UUID txId, String injectFailHeader) {
