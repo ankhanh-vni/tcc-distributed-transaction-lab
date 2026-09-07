@@ -41,7 +41,7 @@ for name, port in [('inventory', 8081), ('payment', 8082), ('order', 8083), ('co
         'command': ['java', '-jar', f'/app/{name}-service-0.1.0-SNAPSHOT.jar'],
         'ports': [f'127.0.0.1:{port + 10000}:{port}']}
 compose_file = output / 'compose.json'
-compose_file.write_text(json.dumps({'services': services, 'networks': {'default': {'internal': True}}}, indent=2))
+compose_file.write_text(json.dumps({'services': services, 'networks': {'default': {'driver': 'bridge'}}}, indent=2))
 compose = ['docker', 'compose', '-p', project, '-f', str(compose_file)]
 
 def command(cmd, **kwargs):
@@ -74,7 +74,8 @@ def request(key, resource, sleep=None, qty=1):
         return {'key': key, 'code': 0, 'ms': (time.perf_counter()-start)*1000, 'error': str(exc)}
 
 def ready():
-    deadline = time.monotonic() + 150
+    deadline = time.monotonic() + 90
+    last_error = None
     while time.monotonic() < deadline:
         try:
             for port, path in [(18080, '/api/transactions/'), (18081, '/tcc/inventory/reservations/'),
@@ -84,8 +85,10 @@ def ready():
                 response = c.getresponse(); response.read(); c.close()
                 if response.status != 404: raise RuntimeError('Not ready')
             return
-        except (OSError, http.client.HTTPException, RuntimeError): time.sleep(1)
-    raise RuntimeError('Sandbox services did not become ready')
+        except (OSError, http.client.HTTPException, RuntimeError) as exc:
+            last_error = f'{port}: {exc}'
+            time.sleep(1)
+    raise RuntimeError(f'Sandbox services did not become ready: {last_error}')
 
 def drain():
     deadline = time.monotonic() + 90
@@ -181,6 +184,9 @@ try:
     results.update(passed=True, confirmed_transactions=len(global_ids), http_requests=sum(c['requests'] for c in results['cases']))
 finally:
     (output/'summary.json').write_text(json.dumps(results,indent=2))
-    try: (output/'containers.log').write_text(command(compose+['logs','--no-color'],timeout=30))
+    try:
+        logs = command(compose+['logs','--no-color'],timeout=30)
+        (output/'containers.log').write_text(logs)
+        if not results['passed']: print(logs[-24000:], flush=True)
     finally: subprocess.run(compose+['down','-v','--remove-orphans'],timeout=60,check=False)
     print('STRESS_RESULT '+json.dumps({k:v for k,v in results.items() if k!='cases'}),flush=True)
