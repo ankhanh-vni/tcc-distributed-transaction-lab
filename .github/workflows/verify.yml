@@ -44,8 +44,22 @@ jobs:
           cache: maven
       - name: Package sandbox services
         run: mvn -B -DskipTests package
-      - name: Stress isolated sandbox
-        run: python3 scripts/stress-test.py --source . --label baseline
+      - name: Build fixed baseline revision
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/tcc-baseline" bcfde6e4fa165c544fe5abca1d7a2012d539494d
+          mvn -B -f "$RUNNER_TEMP/tcc-baseline/pom.xml" -DskipTests package
+      - name: Paired sandbox stress runs
+        run: |
+          for round in 1 2 3; do
+            if [ "$round" = 2 ]; then
+              python3 scripts/stress-test.py --source . --label "candidate-$round"
+              python3 scripts/stress-test.py --source "$RUNNER_TEMP/tcc-baseline" --label "baseline-$round"
+            else
+              python3 scripts/stress-test.py --source "$RUNNER_TEMP/tcc-baseline" --label "baseline-$round"
+              python3 scripts/stress-test.py --source . --label "candidate-$round"
+            fi
+          done
+          python3 scripts/stress-compare.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:

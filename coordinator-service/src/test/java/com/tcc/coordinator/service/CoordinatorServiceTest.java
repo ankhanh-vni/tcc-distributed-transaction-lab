@@ -444,6 +444,43 @@ class CoordinatorServiceTest {
         assertThat(globals.count()).isEqualTo(1);
     }
 
+    @Test
+    void terminalReplayDoesNotWaitForCreationOrDriverLocks() throws Exception {
+        String key = "read-only-replay";
+        UUID id = coordinator.placeOrder(sampleOrder(), null, null, key);
+        try (var connection = jdbc.getDataSource().getConnection();
+             var pool = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            connection.setAutoCommit(false);
+            try {
+                try (var stmt = connection.prepareStatement("select pg_advisory_xact_lock(27182,hashtext(?))")) {
+                    stmt.setString(1, key); stmt.execute();
+                }
+                try (var stmt = connection.prepareStatement("select tx_id from global_transaction where tx_id=? for update")) {
+                    stmt.setObject(1, id); stmt.execute();
+                }
+                var retry = pool.submit(() -> coordinator.placeOrder(sampleOrder(), null, null, key));
+                assertThat(retry.get(5, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(id);
+            } finally { connection.rollback(); }
+        }
+    }
+
+    @Test
+    void directParticipantUpdatesKeepTransactionAndStateGuards() {
+        UUID first = seed(GlobalTxState.TRYING);
+        UUID other = seed(GlobalTxState.TRYING);
+        UUID owner = UUID.randomUUID();
+        txOps.acquire(first, owner);
+        Long otherRow = participants.findByTxIdOrderByIdAsc(other).getFirst().getId();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> txOps.markParticipant(first, owner, otherRow,
+                GlobalTxState.TRYING, ParticipantTxState.TRIED, null)).isInstanceOf(IllegalStateException.class);
+        Long row = participants.findByTxIdOrderByIdAsc(first).getFirst().getId();
+        jdbc.update("update transaction_participant set state='CANCELLED' where id=?", row);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> txOps.markParticipant(first, owner, row,
+                GlobalTxState.TRYING, ParticipantTxState.TRIED, null)).isInstanceOf(IllegalStateException.class);
+        assertThat(participants.findById(row).orElseThrow().getState()).isEqualTo(ParticipantTxState.CANCELLED);
+        assertThat(participants.findById(otherRow).orElseThrow().getState()).isEqualTo(ParticipantTxState.PENDING);
+    }
+
     private TransactionParticipant argParticipantNamed(String name) {
         return org.mockito.ArgumentMatchers.argThat(p -> p != null && name.equals(p.getParticipant()));
     }

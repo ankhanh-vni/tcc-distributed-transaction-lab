@@ -73,8 +73,10 @@ public class CoordinatorService {
         var seed = tx.seedOrGet(idempotencyKey, idempotencyKey == null ? null : fingerprint(req), req,
                 (id, name) -> payloadFor(id, name, req));
         // Replays may resume an abandoned transaction, but never reapply fault-injection headers.
-        drive(seed.txId(), seed.created() ? injectFailHeader : null,
-                seed.created() ? injectConfirmSleepMillis : null);
+        if (!seed.terminal()) {
+            drive(seed.txId(), seed.created() ? injectFailHeader : null,
+                    seed.created() ? injectConfirmSleepMillis : null);
+        }
         return seed.txId();
     }
 

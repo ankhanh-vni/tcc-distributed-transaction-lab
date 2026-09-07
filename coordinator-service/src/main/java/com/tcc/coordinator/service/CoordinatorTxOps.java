@@ -53,21 +53,18 @@ public class CoordinatorTxOps {
     }
 
 
-    public record SeedResult(UUID txId, boolean created) {}
+    public record SeedResult(UUID txId, boolean created, boolean terminal) {}
 
     public SeedResult seedOrGet(String key, String fingerprint, PlaceOrderRequest req,
                                 BiFunction<UUID, String, String> payloadFor) {
         if (key != null) {
-            // Serialize absent-key creation across coordinator instances. A hash
-            // collision only serializes unrelated keys; equality uses the full key.
+            // Existing mappings are immutable and retained indefinitely. Read them
+            // without queuing behind first-use locks; only creation needs exclusion.
+            var found = existingRequest(key, fingerprint);
+            if (found != null) return found;
             jdbc.queryForObject("select 1 from pg_advisory_xact_lock(27182, hashtext(?))", Integer.class, key);
-            var existing = jdbc.query("select tx_id, request_fingerprint from order_idempotency where idempotency_key=?",
-                    (rs, row) -> new StoredRequest(rs.getObject("tx_id", UUID.class), rs.getString("request_fingerprint")), key);
-            if (!existing.isEmpty()) {
-                var stored = existing.getFirst();
-                if (!stored.fingerprint().equals(fingerprint)) throw new IdempotencyConflictException();
-                return new SeedResult(stored.txId(), false);
-            }
+            found = existingRequest(key, fingerprint);
+            if (found != null) return found;
         }
         UUID txId = UUID.randomUUID();
         // Intentional self-call: creation and key reservation belong to this same
@@ -78,10 +75,22 @@ public class CoordinatorTxOps {
             jdbc.update("insert into order_idempotency(idempotency_key, request_fingerprint, tx_id) values (?, ?, ?)",
                     key, fingerprint, txId);
         }
-        return new SeedResult(txId, true);
+        return new SeedResult(txId, true, false);
     }
 
-    private record StoredRequest(UUID txId, String fingerprint) {}
+    private SeedResult existingRequest(String key, String fingerprint) {
+        var rows = jdbc.query("""
+                select k.tx_id, k.request_fingerprint, g.state from order_idempotency k
+                join global_transaction g on g.tx_id=k.tx_id where k.idempotency_key=?
+                """, (rs, row) -> new StoredRequest(rs.getObject("tx_id", UUID.class),
+                        rs.getString("request_fingerprint"), GlobalTxState.valueOf(rs.getString("state"))), key);
+        if (rows.isEmpty()) return null;
+        var stored = rows.getFirst();
+        if (!stored.fingerprint().equals(fingerprint)) throw new IdempotencyConflictException();
+        return new SeedResult(stored.txId(), false, stored.state().isTerminal());
+    }
+
+    private record StoredRequest(UUID txId, String fingerprint, GlobalTxState state) {}
 
     public boolean acquire(UUID txId, UUID token) {
         var g = globals.lockById(txId).orElseThrow();
@@ -137,10 +146,8 @@ public class CoordinatorTxOps {
         return target;
     }
 
-    private TransactionParticipant participant(UUID txId, Long id) {
-        var p = participants.findById(id).orElseThrow();
-        if (!txId.equals(p.getTxId())) throw new IllegalArgumentException("Participant belongs to another transaction");
-        return p;
+    private void requireUpdated(int rows) {
+        if (rows != 1) throw new IllegalStateException("Participant missing, belongs to another transaction, or has an incompatible state");
     }
 
     private void requirePhase(GlobalTransaction g, GlobalTxState phase) {
@@ -150,36 +157,36 @@ public class CoordinatorTxOps {
     // Committed before RPC; also renews ownership without holding a DB transaction over HTTP.
     public void beforeCall(UUID txId, UUID token, Long id, GlobalTxState phase) {
         requirePhase(owned(txId, token), phase);
-        participant(txId, id).markAttempted();
+        requireUpdated(jdbc.update("update transaction_participant set last_attempted_at=clock_timestamp() where tx_id=? and id=?",
+                txId, id));
     }
 
     public void markParticipant(UUID txId, UUID token, Long id, GlobalTxState phase,
                                 ParticipantTxState state, String error) {
         requirePhase(owned(txId, token), phase);
-        var p = participant(txId, id);
-        boolean valid = switch (phase) {
-            case TRYING -> p.getState() == ParticipantTxState.PENDING && state == ParticipantTxState.TRIED;
-            case CONFIRMING -> p.getState() == ParticipantTxState.TRIED && state == ParticipantTxState.CONFIRMED;
-            case CANCELLING -> p.getState() != ParticipantTxState.CONFIRMED && state == ParticipantTxState.CANCELLED;
-            default -> false;
+        String sourcePredicate = switch (phase) {
+            case TRYING -> state == ParticipantTxState.TRIED ? "state='PENDING'" : null;
+            case CONFIRMING -> state == ParticipantTxState.CONFIRMED ? "state='TRIED'" : null;
+            case CANCELLING -> state == ParticipantTxState.CANCELLED ? "state<>'CONFIRMED'" : null;
+            default -> null;
         };
-        if (!valid) throw new IllegalStateException("Illegal participant transition " + p.getState() + " -> " + state);
-        p.setState(state);
-        p.setLastError(error);
+        if (sourcePredicate == null) throw new IllegalStateException("Illegal participant target " + state);
+        // The global row is already locked and ownership checked in this same
+        // transaction. The predicate preserves the previous-state guard in SQL.
+        requireUpdated(jdbc.update("update transaction_participant set state=?, last_error=? where tx_id=? and id=? and " + sourcePredicate,
+                state.name(), error, txId, id));
     }
 
     public void markParticipantAttempted(UUID txId, UUID token, Long id, GlobalTxState phase, String error) {
         requirePhase(owned(txId, token), phase);
-        participant(txId, id).setLastError(error);
+        requireUpdated(jdbc.update("update transaction_participant set last_error=? where tx_id=? and id=?", error, txId, id));
     }
 
     // Failure evidence and the durable decision must commit or roll back together.
     public GlobalTxState failParticipant(UUID txId, UUID token, Long id, GlobalTxState phase, String error) {
         var g = owned(txId, token);
         requirePhase(g, phase);
-        var p = participant(txId, id);
-        p.setState(ParticipantTxState.FAILED);
-        p.setLastError(error);
+        requireUpdated(jdbc.update("update transaction_participant set state='FAILED', last_error=? where tx_id=? and id=?", error, txId, id));
         return transition(g, phase == GlobalTxState.TRYING ? GlobalTxState.CANCELLING : GlobalTxState.HEURISTIC, error);
     }
 }
