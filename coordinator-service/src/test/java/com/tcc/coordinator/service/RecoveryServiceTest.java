@@ -147,6 +147,23 @@ class RecoveryServiceTest {
         org.mockito.Mockito.verifyNoInteractions(participantClient);
     }
 
+    @Test
+    void scanIsBoundedAndExcludesActiveLeasesAndHeuristics() {
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID leased = UUID.randomUUID();
+        UUID heuristic = UUID.randomUUID();
+        for (UUID id : java.util.List.of(first, second, leased, heuristic)) {
+            globals.saveAndFlush(new GlobalTransaction(id, "scan", GlobalTxState.TRYING));
+        }
+        jdbc.update("update global_transaction set updated_at=clock_timestamp() - interval '2 hours'");
+        jdbc.update("update global_transaction set updated_at=clock_timestamp() - interval '3 hours' where tx_id=?", first);
+        jdbc.update("update global_transaction set lease_until=clock_timestamp() + interval '1 hour', driver_token=? where tx_id=?", UUID.randomUUID(), leased);
+        jdbc.update("update global_transaction set state='HEURISTIC' where tx_id=?", heuristic);
+        assertThat(globals.findRecoverable(1, 1)).extracting(GlobalTransaction::getTxId).containsExactly(first);
+        assertThat(globals.findRecoverable(1, 10)).extracting(GlobalTransaction::getTxId).containsExactly(first, second);
+    }
+
     /** Push the global tx's updated_at into the past so the recovery threshold matches it. */
     private void backdate(GlobalTransaction g) {
         jdbc.update("update global_transaction set updated_at=clock_timestamp() - interval '1 hour' where tx_id=?", g.getTxId());

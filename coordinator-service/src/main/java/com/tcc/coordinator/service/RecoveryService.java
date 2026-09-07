@@ -1,17 +1,11 @@
 package com.tcc.coordinator.service;
 
 import com.tcc.coordinator.config.TccProperties;
-import com.tcc.coordinator.domain.GlobalTxState;
 import com.tcc.coordinator.repo.GlobalTransactionRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
 
-import java.time.OffsetDateTime;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.UUID;
 
@@ -39,7 +33,7 @@ public class RecoveryService {
     }
 
     /**
-     * One pass. Returns the number of transactions re-driven. Public so the admin
+     * One pass. Returns the number of eligible transactions submitted for driving. Public so the admin
      * endpoint and tests can trigger it on demand.
      */
     public int recoverOnce() {

@@ -41,3 +41,9 @@ Participant row creation uses `save`, which may invoke JPA merge for assigned id
 New lease settings: `tcc.recovery.lease-ms=30000`, `tcc.recovery.batch-size=100`. The lease renews at each coordinator database operation and before each RPC. A timed-out or expired driver cannot record an outcome after ownership changes. Lease duration should exceed expected HTTP timeouts plus DB latency; expiry remains safe but can cause extra replay. Manual recovery stays available when `tcc.recovery.enabled=false`; only automatic scheduling is disabled.
 
 The V2 migrations add resource version columns and coordinator lease columns. Open Session in View is disabled so independent coordinator transactions do not leave request-bound stale entity snapshots. Resource finalization also takes product/account write locks, reducing optimistic-lock conflicts across different txIds sharing a resource.
+
+## Verification record
+
+Initial repair commit `998c92eccadba37e1819cf955906c313af0b34ad` passed GitHub Actions [run 34091147236](https://github.com/ankhanh-vni/tcc-distributed-transaction-lab/actions/runs/34091147236): all modules packaged; 77 tests passed, zero failures/errors/skips; all 11 required PostgreSQL/Compose integration suites ran. The subsequent revision adds explicit database-commit rollback and bounded recovery scan checks. Its result is tracked by the PR checks.
+
+Local verification parsed all Maven XML and YAML, passed `git diff --check`, and confirmed that the report gate rejects missing integration reports. Java/Maven/Docker execution occurred on GitHub's runner because this workspace lacks those working runtimes. This is functional and concurrent regression coverage, not a load test, exhaustive fault-injection proof, dependency vulnerability audit, or production security certification.

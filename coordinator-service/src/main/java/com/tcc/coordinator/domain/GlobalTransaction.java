@@ -20,7 +20,7 @@ public class GlobalTransaction {
     @Column(name = "tx_id")
     private UUID txId;
 
-    @Column(name = "business_key")
+    @Column(name = "business_key", length = 135)
     private String businessKey;
 
     @Enumerated(EnumType.STRING)

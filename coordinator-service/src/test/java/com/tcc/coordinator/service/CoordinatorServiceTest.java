@@ -312,6 +312,24 @@ class CoordinatorServiceTest {
         assertThat(coordinator.drive(id, null)).isEqualTo(GlobalTxState.CONFIRMED);
     }
 
+    @Test
+    void failedDecisionCommitRollsBackParticipantFailureToo() {
+        UUID id = seed(GlobalTxState.TRYING);
+        UUID owner = UUID.randomUUID();
+        txOps.acquire(id, owner);
+        Long row = participants.findByTxIdOrderByIdAsc(id).getFirst().getId();
+        jdbc.execute("alter table global_transaction add constraint test_reject_cancel check (state <> 'CANCELLING') not valid");
+        try {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    txOps.failParticipant(id, owner, row, GlobalTxState.TRYING, "timeout"))
+                    .isInstanceOf(RuntimeException.class);
+            assertThat(globals.findById(id).orElseThrow().getState()).isEqualTo(GlobalTxState.TRYING);
+            assertThat(participants.findById(row).orElseThrow().getState()).isEqualTo(ParticipantTxState.PENDING);
+        } finally {
+            jdbc.execute("alter table global_transaction drop constraint test_reject_cancel");
+        }
+    }
+
     private TransactionParticipant argParticipantNamed(String name) {
         return org.mockito.ArgumentMatchers.argThat(p -> p != null && name.equals(p.getParticipant()));
     }
