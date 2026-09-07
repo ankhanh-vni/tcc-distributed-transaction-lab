@@ -24,14 +24,15 @@ public final class TccSystem {
 
     public static synchronized void start() {
         if (compose != null) return;
-        compose = new ComposeContainer(new File("../docker-compose.yml"))
+        var starting = new ComposeContainer(new File("../docker-compose.yml"))
                 .withExposedService("postgres", 5432, Wait.forListeningPort().withStartupTimeout(Duration.ofSeconds(120)))
                 .withExposedService("inventory-service", 8081, Wait.forHttp("/actuator/health").forStatusCode(200).forStatusCode(404).withStartupTimeout(Duration.ofMinutes(2)))
                 .withExposedService("payment-service", 8082, Wait.forHttp("/actuator/health").forStatusCode(200).forStatusCode(404).withStartupTimeout(Duration.ofMinutes(2)))
                 .withExposedService("order-service", 8083, Wait.forHttp("/actuator/health").forStatusCode(200).forStatusCode(404).withStartupTimeout(Duration.ofMinutes(2)))
                 .withExposedService("coordinator-service", 8080, Wait.forHttp("/actuator/health").forStatusCode(200).forStatusCode(404).withStartupTimeout(Duration.ofMinutes(2)))
                 .withLocalCompose(true);
-        compose.start();
+        starting.start();
+        compose = starting;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> compose.stop()));
     }
 

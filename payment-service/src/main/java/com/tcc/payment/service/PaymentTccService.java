@@ -10,7 +10,8 @@ import com.tcc.payment.repo.AccountRepository;
 import com.tcc.payment.repo.PaymentAuthorizationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,6 +20,17 @@ import java.util.UUID;
 
 @Service
 public class PaymentTccService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    // Row locks cannot protect a missing txId. The transaction-scoped lock covers
+    // the first read through commit, including preventive Cancel and concurrent Try.
+    private void lockTransaction(UUID txId) {
+        long key = txId.getMostSignificantBits() ^ txId.getLeastSignificantBits();
+        entityManager.createNativeQuery("select 1 from pg_advisory_xact_lock(:key)")
+                .setParameter("key", key).getSingleResult();
+    }
 
     private static final Logger log = LoggerFactory.getLogger(PaymentTccService.class);
 
@@ -32,6 +44,7 @@ public class PaymentTccService {
 
     @Transactional
     public ParticipantState tryAuthorize(UUID txId, AuthorizeRequest req) {
+        lockTransaction(txId);
         var existing = authorizations.lockById(txId);
         if (existing.isPresent()) {
             return switch (existing.get().getState()) {
@@ -45,19 +58,14 @@ public class PaymentTccService {
                 .orElseThrow(() -> new TccException(TccErrorCode.BUSINESS_PRECONDITION_FAILED,
                         "unknown customerId=" + req.customerId()));
         account.freeze(req.amount());
-        try {
-            authorizations.save(new PaymentAuthorization(txId, account.getId(), req.amount(), ParticipantState.TRIED));
-        } catch (DataIntegrityViolationException duplicate) {
-            var winner = authorizations.lockById(txId).orElseThrow();
-            log.info("[try] concurrent retry resolved: tx={} state={}", txId, winner.getState());
-            return winner.getState();
-        }
+        authorizations.save(new PaymentAuthorization(txId, account.getId(), req.amount(), ParticipantState.TRIED));
         log.info("[try] frozen amount={} customer={} tx={}", req.amount(), req.customerId(), txId);
         return ParticipantState.TRIED;
     }
 
     @Transactional
     public ParticipantState confirm(UUID txId) {
+        lockTransaction(txId);
         var existing = authorizations.lockById(txId)
                 .orElseThrow(() -> new TccException(TccErrorCode.UNKNOWN_TX,
                         "cannot confirm unknown tx=" + txId));
@@ -68,7 +76,7 @@ public class PaymentTccService {
                 throw new TccException(TccErrorCode.CONFIRM_AFTER_CANCEL,
                         "Confirm after Cancel: tx=" + txId);
             case TRIED:
-                Account account = accounts.findById(existing.getAccountId()).orElseThrow();
+                Account account = accounts.lockById(existing.getAccountId()).orElseThrow();
                 account.capture(existing.getAmount());
                 existing.setState(ParticipantState.CONFIRMED);
                 log.info("[confirm] captured amount={} customer={} tx={}",
@@ -82,19 +90,11 @@ public class PaymentTccService {
 
     @Transactional
     public ParticipantState cancel(UUID txId) {
+        lockTransaction(txId);
         var existing = authorizations.lockById(txId);
         if (existing.isEmpty()) {
-            try {
-                authorizations.save(new PaymentAuthorization(txId, null, BigDecimal.ZERO, ParticipantState.CANCELLED));
-                log.info("[cancel] preventive tombstone written tx={}", txId);
-            } catch (DataIntegrityViolationException race) {
-                var racer = authorizations.lockById(txId).orElseThrow();
-                if (racer.getState() == ParticipantState.CONFIRMED) {
-                    throw new TccException(TccErrorCode.CANCEL_AFTER_CONFIRM,
-                            "Cancel after Confirm: tx=" + txId);
-                }
-                return racer.getState();
-            }
+            authorizations.save(new PaymentAuthorization(txId, null, BigDecimal.ZERO, ParticipantState.CANCELLED));
+            log.info("[cancel] preventive tombstone written tx={}", txId);
             return ParticipantState.CANCELLED;
         }
         switch (existing.get().getState()) {
@@ -104,7 +104,7 @@ public class PaymentTccService {
                 throw new TccException(TccErrorCode.CANCEL_AFTER_CONFIRM,
                         "Cancel after Confirm: tx=" + txId);
             case TRIED:
-                Account account = accounts.findById(existing.get().getAccountId()).orElseThrow();
+                Account account = accounts.lockById(existing.get().getAccountId()).orElseThrow();
                 account.unfreeze(existing.get().getAmount());
                 existing.get().setState(ParticipantState.CANCELLED);
                 log.info("[cancel] unfrozen amount={} customer={} tx={}",

@@ -188,3 +188,21 @@ even on machines without Docker.
 
 A "phase 2" would add OTel tracing across services, Saga comparison module, and
 HA coordinator election.
+
+
+## Client retry safety
+
+Send a stable `Idempotency-Key` for each intended order and reuse it after timeouts or lost responses:
+
+```bash
+curl -s http://localhost:8080/api/orders \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: checkout-7efb9d42' \
+  -d '{"customerId":"CUST-1","sku":"SKU-A","qty":1,"amount":100.00}'
+```
+
+The same key and order details return the same `txId` and its **current** status. Concurrent retries share one transaction. A different customer, SKU, quantity or amount under the same key returns `409` with code `IDEMPOTENCY_KEY_REUSED`. JSON property order and equivalent monetary values (`100`, `100.0`, `100.00`) do not change request identity.
+
+Keys are case-sensitive, 1–128 ASCII letters/digits or `.`, `_`, `:`, `-`; invalid keys return `400`. The header is optional for compatibility: requests without it still create a new transaction every time. Use a new key for an intentional new order, including after a cancelled order. Retrying a non-terminal transaction may resume recovery; terminal transactions, including `HEURISTIC`, are never restarted. Replays ignore fault-injection headers.
+
+Keys and request identity are committed atomically with the global transaction and participant log in coordinator_db (migration V3), before any RPC. No automatic expiration or deletion is provided: removing a key would allow a late retry to create another order. Keys have a global namespace for this unauthenticated lab endpoint; use UUIDs or a client namespace, and scope keys to authenticated principals if adding multi-tenant authentication. A key is not an authorization credential.

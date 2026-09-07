@@ -1,0 +1,67 @@
+name: Verify TCC protocol
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Require Docker
+        run: docker info && docker compose version
+      - name: Package fresh service jars
+        run: mvn -B -DskipTests package
+      - name: Run all unit, PostgreSQL and Compose tests
+        run: mvn -B test
+      - name: Require executed integration suites
+        run: python3 scripts/check-test-reports.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: '**/target/surefire-reports/*'
+
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Package sandbox services
+        run: mvn -B -DskipTests package
+      - name: Build fixed baseline revision
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/tcc-baseline" bcfde6e4fa165c544fe5abca1d7a2012d539494d
+          mvn -B -f "$RUNNER_TEMP/tcc-baseline/pom.xml" -DskipTests package
+      - name: Paired sandbox stress runs
+        run: |
+          for round in 1 2 3; do
+            if [ "$round" = 2 ]; then
+              python3 scripts/stress-test.py --source . --label "candidate-$round"
+              python3 scripts/stress-test.py --source "$RUNNER_TEMP/tcc-baseline" --label "baseline-$round"
+            else
+              python3 scripts/stress-test.py --source "$RUNNER_TEMP/tcc-baseline" --label "baseline-$round"
+              python3 scripts/stress-test.py --source . --label "candidate-$round"
+            fi
+          done
+          python3 scripts/stress-compare.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-results
+          path: stress-results/

@@ -1,6 +1,8 @@
 package com.tcc.coordinator.client;
 
 import com.tcc.common.headers.TccHeaders;
+import com.tcc.common.dto.TccStatusResponse;
+import com.tcc.common.tcc.ParticipantState;
 import com.tcc.coordinator.domain.TransactionParticipant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,14 +33,17 @@ public class ParticipantClient {
         String url = p.getBaseUrl() + p.getResourcePath();
         log.debug("[try] -> {} tx={} payload={}", url, p.getTxId(), p.getPayloadJson());
         try {
-            http.post()
+            var response = http.post()
                     .uri(url)
                     .contentType(MediaType.APPLICATION_JSON)
                     .header(TccHeaders.TX_ID, p.getTxId().toString())
                     .headers(h -> { if (optionalFailHeader != null) h.add(TccHeaders.FAIL_AT, optionalFailHeader); })
                     .body(p.getPayloadJson())
                     .retrieve()
-                    .toBodilessEntity();
+                    .body(TccStatusResponse.class);
+            validate(p, "TRY", response);
+        } catch (ParticipantCallException ex) {
+            throw ex;
         } catch (RestClientResponseException ex) {
             throw new ParticipantCallException(p.getParticipant(), "TRY", ex.getStatusCode().value(), ex.getResponseBodyAsString(), ex);
         } catch (Exception ex) {
@@ -54,12 +59,15 @@ public class ParticipantClient {
         String url = p.getBaseUrl() + p.getResourcePath() + "/" + p.getTxId() + "/confirm";
         log.debug("[confirm] -> {}", url);
         try {
-            http.put()
+            var response = http.put()
                     .uri(url)
                     .header(TccHeaders.TX_ID, p.getTxId().toString())
                     .headers(h -> { if (optionalSleepMillis != null) h.add(TccHeaders.SLEEP_MILLIS, optionalSleepMillis); })
                     .retrieve()
-                    .toBodilessEntity();
+                    .body(TccStatusResponse.class);
+            validate(p, "CONFIRM", response);
+        } catch (ParticipantCallException ex) {
+            throw ex;
         } catch (RestClientResponseException ex) {
             throw new ParticipantCallException(p.getParticipant(), "CONFIRM", ex.getStatusCode().value(), ex.getResponseBodyAsString(), ex);
         } catch (Exception ex) {
@@ -71,15 +79,27 @@ public class ParticipantClient {
         String url = p.getBaseUrl() + p.getResourcePath() + "/" + txId;
         log.debug("[cancel] -> {}", url);
         try {
-            http.delete()
+            var response = http.delete()
                     .uri(url)
                     .header(TccHeaders.TX_ID, txId.toString())
                     .retrieve()
-                    .toBodilessEntity();
+                    .body(TccStatusResponse.class);
+            validate(p, "CANCEL", response);
+        } catch (ParticipantCallException ex) {
+            throw ex;
         } catch (RestClientResponseException ex) {
             throw new ParticipantCallException(p.getParticipant(), "CANCEL", ex.getStatusCode().value(), ex.getResponseBodyAsString(), ex);
         } catch (Exception ex) {
             throw new ParticipantCallException(p.getParticipant(), "CANCEL", -1, ex.getMessage(), ex);
         }
+    }
+    private void validate(TransactionParticipant p, String phase, TccStatusResponse response) {
+        boolean valid = response != null && p.getTxId().equals(response.txId()) && switch (phase) {
+            case "TRY" -> response.state() == ParticipantState.TRIED || response.state() == ParticipantState.CONFIRMED;
+            case "CONFIRM" -> response.state() == ParticipantState.CONFIRMED;
+            case "CANCEL" -> response.state() == ParticipantState.CANCELLED;
+            default -> false;
+        };
+        if (!valid) throw new ParticipantCallException(p.getParticipant(), phase, 502, "Invalid participant response", null);
     }
 }

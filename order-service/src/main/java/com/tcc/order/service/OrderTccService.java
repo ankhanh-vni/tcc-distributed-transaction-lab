@@ -9,7 +9,8 @@ import com.tcc.order.domain.OrderState;
 import com.tcc.order.repo.CustomerOrderRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,6 +19,17 @@ import java.util.UUID;
 
 @Service
 public class OrderTccService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    // Row locks cannot protect a missing txId. The transaction-scoped lock covers
+    // the first read through commit, including preventive Cancel and concurrent Try.
+    private void lockTransaction(UUID txId) {
+        long key = txId.getMostSignificantBits() ^ txId.getLeastSignificantBits();
+        entityManager.createNativeQuery("select 1 from pg_advisory_xact_lock(:key)")
+                .setParameter("key", key).getSingleResult();
+    }
 
     private static final Logger log = LoggerFactory.getLogger(OrderTccService.class);
 
@@ -33,6 +45,7 @@ public class OrderTccService {
      */
     @Transactional
     public ParticipantState tryCreate(UUID txId, CreateOrderRequest req) {
+        lockTransaction(txId);
         var existing = orders.lockById(txId);
         if (existing.isPresent()) {
             return switch (existing.get().getState()) {
@@ -42,19 +55,14 @@ public class OrderTccService {
                         "Try after preventive Cancel: tx already cancelled tx=" + txId);
             };
         }
-        try {
-            orders.save(new CustomerOrder(txId, req.customerId(), req.sku(), req.qty(), req.amount(), OrderState.PENDING));
-        } catch (DataIntegrityViolationException race) {
-            var winner = orders.lockById(txId).orElseThrow();
-            log.info("[try] concurrent retry resolved: tx={} state={}", txId, winner.getState());
-            return mapState(winner.getState());
-        }
+        orders.save(new CustomerOrder(txId, req.customerId(), req.sku(), req.qty(), req.amount(), OrderState.PENDING));
         log.info("[try] created pending order tx={} customer={} sku={}", txId, req.customerId(), req.sku());
         return ParticipantState.TRIED;
     }
 
     @Transactional
     public ParticipantState confirm(UUID txId) {
+        lockTransaction(txId);
         var order = orders.lockById(txId)
                 .orElseThrow(() -> new TccException(TccErrorCode.UNKNOWN_TX,
                         "cannot confirm unknown order tx=" + txId));
@@ -75,19 +83,11 @@ public class OrderTccService {
 
     @Transactional
     public ParticipantState cancel(UUID txId) {
+        lockTransaction(txId);
         var existing = orders.lockById(txId);
         if (existing.isEmpty()) {
-            try {
-                orders.save(new CustomerOrder(txId, "tombstone", "tombstone", 0, BigDecimal.ZERO, OrderState.CANCELLED));
-                log.info("[cancel] preventive tombstone written tx={}", txId);
-            } catch (DataIntegrityViolationException race) {
-                var racer = orders.lockById(txId).orElseThrow();
-                if (racer.getState() == OrderState.CONFIRMED) {
-                    throw new TccException(TccErrorCode.CANCEL_AFTER_CONFIRM,
-                            "Cancel after Confirm: tx=" + txId);
-                }
-                return mapState(racer.getState());
-            }
+            orders.save(new CustomerOrder(txId, "tombstone", "tombstone", 0, BigDecimal.ZERO, OrderState.CANCELLED));
+            log.info("[cancel] preventive tombstone written tx={}", txId);
             return ParticipantState.CANCELLED;
         }
         switch (existing.get().getState()) {

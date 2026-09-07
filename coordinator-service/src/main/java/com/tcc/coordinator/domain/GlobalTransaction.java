@@ -20,7 +20,7 @@ public class GlobalTransaction {
     @Column(name = "tx_id")
     private UUID txId;
 
-    @Column(name = "business_key")
+    @Column(name = "business_key", length = 135)
     private String businessKey;
 
     @Enumerated(EnumType.STRING)
@@ -47,6 +47,16 @@ public class GlobalTransaction {
         this.businessKey = businessKey;
         this.state = state;
     }
+
+    @Column(name = "driver_token")
+    private UUID driverToken;
+
+    @Column(name = "lease_until")
+    private OffsetDateTime leaseUntil;
+
+    public UUID getDriverToken() { return driverToken; }
+    public OffsetDateTime getLeaseUntil() { return leaseUntil; }
+    public void lease(UUID token, OffsetDateTime until) { driverToken = token; leaseUntil = until; }
 
     @PrePersist
     void onInsert() {

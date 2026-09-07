@@ -38,7 +38,7 @@ These are the rules the system actually depends on. Several span multiple files 
 `CoordinatorService.runTryPhase`/`runConfirmPhase`/`runCancelPhase` always call `CoordinatorTxOps.transitionGlobal` / `markParticipant*` **before** the participant HTTP call. If a crash happens between, the recovery loop reads the persisted intent and re-drives. **Never** flip this order — there is no other recovery story.
 
 ### 2. Participants are idempotent by `tx_id` PK
-Every participant table (`inventory_reservation`, `payment_freeze`, etc.) uses `tx_id` as the primary key. The insert is the "first time" guard; concurrent retries collide on the unique constraint and one branch re-reads the existing row (see `InventoryTccService.tryReserve`'s `DataIntegrityViolationException` catch). Don't add surrogate keys, and don't assume "this can't be a duplicate."
+Every participant table (`inventory_reservation`, `payment_freeze`, etc.) uses `tx_id` as the primary key. Every phase takes a transaction-scoped PostgreSQL advisory lock before reading the txId row, including when that row is absent. Keep the lock through commit. Do not catch duplicate-insert errors inside an already failed transaction; JPA save may also merge assigned-id entities. Don't add surrogate keys, and don't assume "this can't be a duplicate."
 
 ### 3. Preventive cancel writes a tombstone
 A `cancel(txId)` that finds **no row** must `INSERT` a `CANCELLED` row, not no-op. This closes the race where a slow Try arrives after the coordinator has already given up. The late Try then sees the tombstone and rejects with 409. See `InventoryTccService.cancel` lines around the `existing.isEmpty()` branch — keep this shape in any new participant.
@@ -72,7 +72,7 @@ Per-participant: `X-Fail-At: TRY|CONFIRM|CANCEL` and `X-Sleep-Millis: N`. The co
 ## Recovery tuning
 
 `TccProperties.Recovery` exposes:
-- `tcc.recovery.enabled` (default true) — `RecoveryService` is `@ConditionalOnProperty` on this; tests disable it to drive recovery manually via `coordinator.recoverOnce()`.
+- `tcc.recovery.enabled` (default true) — `RecoveryScheduler` is `@ConditionalOnProperty` on this; manual `RecoveryService` remains available; tests disable it to drive recovery manually via `recovery.recoverOnce()`.
 - `tcc.recovery.fixed-delay-ms` (5000) — scheduler period.
 - `tcc.recovery.stuck-after-ms` (8000) — minimum age before a non-terminal tx is considered stuck.
 
@@ -84,3 +84,4 @@ Tests that need deterministic recovery typically set `tcc.recovery.enabled=false
 - `inventory-service` (`:8081`), `payment-service` (`:8082`), `order-service` (`:8083`) — TCC participants. Each follows the `*TccController` → `*TccService` → JPA entity pattern; copy `inventory-service` when adding a new participant.
 - `coordinator-service` (`:8080`) — global tx state machine, participant HTTP client, `@Scheduled` recovery loop, admin endpoint.
 - `e2e-tests` — Docker-Compose-backed integration tests; numbered scenarios documented in README.
+

@@ -9,6 +9,7 @@ spring:
     username: ${COORDINATOR_DB_USER:coordinator}
     password: ${COORDINATOR_DB_PASS:coordinator}
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
   flyway:
@@ -37,3 +38,4 @@ tcc:
 logging:
   level:
     com.tcc: DEBUG
+

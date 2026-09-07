@@ -9,6 +9,7 @@ spring:
     username: ${ORDER_DB_USER:orders}
     password: ${ORDER_DB_PASS:orders}
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
   flyway:
@@ -18,3 +19,4 @@ spring:
 logging:
   level:
     com.tcc: DEBUG
+
